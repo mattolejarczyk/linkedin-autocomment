@@ -1,0 +1,5 @@
+# gitleaks findings reviewed by hand and confirmed NOT real secrets (2026-10-29). One fingerprint per line.
+# Only add a line after checking the value is a test fixture or placeholder; a real key is rotated, never ignored.
+# tests/test_silent_surfaces.py: a made-up test password. docs/INSTALL-MACOS.md: a truncated "sk-p..." placeholder in an example.
+940aa4248289e05764ce4a10abd95a1ac4d86e97:tests/test_silent_surfaces.py:generic-api-key:243
+5e5a9aa75af745670282a96e480db1f08491892b:docs/INSTALL-MACOS.md:generic-api-key:114

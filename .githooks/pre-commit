@@ -1,0 +1,28 @@
+#!/bin/sh
+# Secret check before every commit (operator rule 2026-10-29, ZERO tolerance). Installed by agentos/tools/install-secret-hooks.ps1.
+# Fails CLOSED: if gitleaks cannot be found, the commit is refused. Never bypass this (no --no-verify).
+GL="$(command -v gitleaks 2>/dev/null)"
+[ -z "$GL" ] && [ -x "$LOCALAPPDATA/Microsoft/WinGet/Links/gitleaks.exe" ] && GL="$LOCALAPPDATA/Microsoft/WinGet/Links/gitleaks.exe"
+[ -z "$GL" ] && GL="$(ls "$LOCALAPPDATA"/Microsoft/WinGet/Packages/Gitleaks.Gitleaks_*/gitleaks.exe 2>/dev/null | head -n 1)"
+if [ -z "$GL" ]; then
+  echo "BLOCKED: gitleaks not found, so the secret check cannot run. Commit refused (fail closed)." >&2
+  exit 1
+fi
+
+# 1. Secret-type FILES are never committed, even if forced past .gitignore. Templates (.example/.sample/.template) are allowed;
+#    their contents are still scanned in step 2.
+bad="$(git diff --cached --name-only --diff-filter=ACMR | grep -Ei '(^|/)(\.env[^/]*|[^/]*\.env|[^/]*\.pem|[^/]*\.key|[^/]*\.p12|[^/]*\.pfx|id_rsa[^/]*|id_ed25519[^/]*|[^/]*credentials[^/]*|[^/]*secret[^/]*|[^/]*token[^/]*\.json|[^/]*cookies?[^/]*\.json|auth\.json)$' | grep -Eiv '\.(example|sample|template)$')"
+if [ -n "$bad" ]; then
+  echo "BLOCKED: these files look like secrets and may never be committed:" >&2
+  echo "$bad" | sed 's/^/  /' >&2
+  echo "Secrets belong outside git (a git-ignored .env file). Unstage them: git restore --staged <file>" >&2
+  exit 1
+fi
+
+# 2. Scan the staged CHANGES for keys (gitleaks rules, plus a .gitleaks.toml / .gitleaksignore in the repo if present).
+if ! "$GL" git --pre-commit --staged --redact --no-banner --exit-code 1 .; then
+  echo "BLOCKED: gitleaks found what looks like a secret in the staged changes (shown redacted above)." >&2
+  echo "Remove it, keep the real value in a git-ignored .env file, and tell the operator. Never bypass this check." >&2
+  exit 1
+fi
+exit 0
