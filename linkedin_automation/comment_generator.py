@@ -241,8 +241,40 @@ RESPOND WITH JSON:
             est_cost=est_cost,
         )
 
+    def _record_reply_failure(self, kind: str, post: Dict, completion,
+                              attempt: int = None, detail: str = None):
+        """Save the evidence for a model reply that could not be used.
+
+        One JSON line per failure in ``reply_failures.jsonl`` beside the drafts:
+        which call, which post, and what came back (the start of the text, the
+        finish reason, the reasoning tokens). The log line names the file, so a
+        run that loses a draft says where to look instead of queuing a blank.
+        """
+        path = os.path.join(self.output_dir, "reply_failures.jsonl")
+        finish_reason = getattr(completion, "finish_reason", None)
+        record = {
+            "at": datetime.now().isoformat(),
+            "kind": kind,
+            "provider": self.provider_name,
+            "model": getattr(completion, "model", None),
+            "post_url": post.get("url") or "",
+            "attempt": attempt,
+            "finish_reason": finish_reason,
+            "reasoning_tokens": getattr(completion, "reasoning_tokens", None),
+            "text_start": (getattr(completion, "text", "") or "")[:300],
+            "detail": detail,
+        }
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+        except OSError:
+            self.logger.warning(f"Could not write reply evidence to {path}", exc_info=True)
+        self.logger.warning(
+            f"  Unusable {kind} reply (finish_reason={finish_reason}); evidence: {path}")
+
     def evaluate_post_quality(self, post: Dict) -> Dict:
         """Evaluate if post is worth commenting on."""
+        completion = None
         try:
             # GPT-4o-mini per PROJECT.md (was hardcoded gpt-3.5-turbo).
             self._log_api_usage("chat.completions:evaluate", 0.0002)
@@ -254,10 +286,14 @@ RESPOND WITH JSON:
                 json_object=True,
             )
 
-            return json.loads(completion.text)
+            return providers.parse_json_reply(completion.text)
 
         except Exception as e:
             self.logger.error(f"Evaluation error: {e}")
+            if completion is not None:
+                # The call worked but the reply did not parse. Keep what came
+                # back: this failed twice on 2026-10-31 and nothing said why.
+                self._record_reply_failure("evaluate", post, completion, detail=str(e))
             # Bias toward engaging on transient eval errors (the user is an AI
             # consultant; the post finder already removed junk upstream).
             return {"verdict": "engage", "reason": f"Evaluation error, defaulting to engage: {e}"}
@@ -300,6 +336,11 @@ RESPOND WITH JSON:
                 max_tokens=3,
             )
             answer = (completion.text or "").strip().upper()
+            if not answer:
+                # No answer is not a NO. Treated like an API error (relevant),
+                # rather than paying to regenerate a comment nobody judged.
+                self._record_reply_failure("relevance", post, completion)
+                return True
             relevant = answer.startswith("YES")
             if not relevant:
                 self.logger.info("  Relevance check: NO (off-topic / forced expertise) — regenerating")
@@ -687,7 +728,15 @@ Write ONLY the {r.action} text:"""
 
                 comment = (completion.text or "").strip()
                 comment = comment.strip('"\'')  # Remove quotes if added
-                
+
+                # An empty reply is a failed attempt, never a draft. It scored
+                # zero AI-pattern issues, so it used to win best_attempt and be
+                # queued as a blank comment.
+                if not comment:
+                    self._record_reply_failure("generate", post, completion,
+                                               attempt=attempt + 1)
+                    continue
+
                 # Check authenticity with new detector
                 is_authentic, issues = self.detect_ai_patterns(comment)
 

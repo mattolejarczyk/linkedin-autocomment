@@ -113,7 +113,8 @@ def test_every_built_in_provider_returns_the_identical_normalised_shape(recorded
 
     shapes = {tuple(sorted(vars(c))) for c in results.values()}
     assert len(shapes) == 1
-    assert shapes.pop() == ("model", "provider", "reasoning_stripped", "text")
+    assert shapes.pop() == ("finish_reason", "model", "provider", "reasoning_stripped",
+                            "reasoning_tokens", "text")
 
 
 def test_the_custom_provider_works_with_only_a_base_url_and_model(recorded):
@@ -271,8 +272,79 @@ def test_max_tokens_param_name_comes_from_the_spec(recorded, monkeypatch):
     providers.get_provider("renamed").complete(
         model="m", system="SYS", user="USR", max_tokens=50)
     sent = recorded["renamed"].calls[0]
-    assert sent["max_completion_tokens"] == 50
+    assert sent["max_completion_tokens"] == 50 + providers.REASONING_HEADROOM_TOKENS
     assert "max_tokens" not in sent
+
+
+# ─── JSON replies ─────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("reply", [
+    '{"verdict": "engage"}',
+    '```json\n{"verdict": "engage"}\n```',
+    '```\n{"verdict": "engage"}\n```',
+    '  ```json {"verdict": "engage"} ```  ',
+])
+def test_json_reply_parses_bare_or_fenced(reply):
+    assert providers.parse_json_reply(reply) == {"verdict": "engage"}
+
+
+@pytest.mark.parametrize("reply", ["", "not json", "Here you go: {\"verdict\": \"engage\"}"])
+def test_a_reply_that_is_not_json_still_raises(reply):
+    with pytest.raises(ValueError):
+        providers.parse_json_reply(reply)
+
+
+# ─── Token budget: max_tokens is an answer budget ─────────────────────────────
+
+def test_max_tokens_gets_reasoning_headroom_on_top(recorded):
+    """A thinking model spent a 100-token cap thinking and returned no comment."""
+    providers.get_provider("openrouter").complete(
+        model="anthropic/claude-sonnet-5.5", system="SYS", user="USR", max_tokens=100)
+    assert recorded["openrouter"].calls[0]["max_tokens"] == 100 + providers.REASONING_HEADROOM_TOKENS
+
+    providers.get_provider("anthropic").complete(
+        model="claude-haiku-4-5", system="SYS", user="USR", max_tokens=3)
+    assert recorded["anthropic"].calls[0]["max_tokens"] == 3 + providers.REASONING_HEADROOM_TOKENS
+
+
+def test_no_max_tokens_still_sends_no_cap(recorded):
+    providers.get_provider("openai").complete(model="gpt-4o-mini", system="S", user="U")
+    assert "max_tokens" not in recorded["openai"].calls[0]
+
+
+class _ThinkingOpenAIClient:
+    """A reply shaped like OpenRouter's when the cap ran out mid-thought."""
+
+    def __init__(self, text, finish_reason, reasoning_tokens):
+        message = type("M", (), {"content": text, "reasoning_content": None})
+        choice = type("C", (), {"message": message, "finish_reason": finish_reason})
+        details = type("D", (), {"reasoning_tokens": reasoning_tokens})
+        usage = type("U", (), {"completion_tokens_details": details})
+        response = type("R", (), {"choices": [choice], "usage": usage})
+        self.chat = type("Chat", (), {"completions": type(
+            "Comp", (), {"create": staticmethod(lambda **kwargs: response)})()})()
+
+
+def test_finish_reason_and_reasoning_tokens_are_reported(monkeypatch, caplog):
+    monkeypatch.setattr(providers, "resolve_api_key", lambda provider, explicit=None: "sk-dummy")
+    monkeypatch.setattr(providers.OpenAICompatibleProvider, "_client",
+                        lambda self: _ThinkingOpenAIClient(None, "length", 100))
+    completion = providers.get_provider("openrouter").complete(
+        model="m", system="S", user="U", max_tokens=100)
+    assert completion.text == ""
+    assert completion.finish_reason == "length"
+    assert completion.reasoning_tokens == 100
+    assert "returned no answer text (finish_reason=length, reasoning_tokens=100" in caplog.text
+
+
+def test_an_ordinary_reply_reports_its_finish_reason_quietly(monkeypatch, caplog):
+    monkeypatch.setattr(providers, "resolve_api_key", lambda provider, explicit=None: "sk-dummy")
+    monkeypatch.setattr(providers.OpenAICompatibleProvider, "_client",
+                        lambda self: _ThinkingOpenAIClient("A comment.", "stop", 0))
+    completion = providers.get_provider("openrouter").complete(model="m", system="S", user="U")
+    assert completion.text == "A comment."
+    assert completion.finish_reason == "stop"
+    assert "no answer text" not in caplog.text
 
 
 def test_a_provider_without_a_system_role_folds_it_into_the_user_turn(recorded, monkeypatch):

@@ -160,6 +160,94 @@ def test_relevant_comment_accepted_first_try(make_generator, monkeypatch):
     assert client.relevance_calls == 1
 
 
+# ─── Empty replies: never a draft, always evidence ────────────────────────────
+
+def _evidence(g):
+    import json
+    import os
+    path = os.path.join(g.output_dir, "reply_failures.jsonl")
+    if not os.path.exists(path):
+        return []
+    return [json.loads(line) for line in open(path, encoding="utf-8")]
+
+
+class EmptyThenClient(FakeClient):
+    """Empty generation replies shaped like a thinking model that ran out of cap."""
+
+    def complete(self, model, system, user, temperature=None,
+                 max_tokens=None, json_object=False):
+        completion = super().complete(model, system, user, temperature, max_tokens, json_object)
+        if not completion.text:
+            completion.finish_reason = "length"
+            completion.reasoning_tokens = 100
+        return completion
+
+
+def test_all_empty_replies_give_no_draft_and_keep_evidence(make_generator, monkeypatch):
+    """Three blanks used to be returned as a 0-word draft and queued."""
+    client = EmptyThenClient(generation_outputs=["", "", ""])
+    g = make_generator(client=client)
+    monkeypatch.setattr(g, "detect_ai_patterns", lambda c: (True, []))
+
+    assert g.generate_comment(POST_ECON, {"post_category": "thought_piece"}) is None
+    assert client.relevance_calls == 0              # nothing to judge, nothing paid
+    evidence = _evidence(g)
+    assert [e["kind"] for e in evidence] == ["generate"] * 3
+    assert [e["attempt"] for e in evidence] == [1, 2, 3]
+    assert evidence[0]["finish_reason"] == "length"
+    assert evidence[0]["reasoning_tokens"] == 100
+
+
+def test_a_real_reply_after_an_empty_one_is_used_untouched(make_generator, monkeypatch):
+    client = EmptyThenClient(generation_outputs=["", "The capex point is the real story."],
+                             relevance_outputs=["YES"])
+    g = make_generator(client=client)
+    monkeypatch.setattr(g, "detect_ai_patterns", lambda c: (True, []))
+
+    result = g.generate_comment(POST_ECON, {"post_category": "thought_piece"})
+    assert result["comment"] == "The capex point is the real story."
+    assert result["attempt"] == 2
+    assert len(_evidence(g)) == 1
+
+
+def test_an_empty_relevance_answer_is_not_a_no(make_generator):
+    """An unjudged comment must not be thrown away and paid for again."""
+    client = FakeClient(relevance_outputs=[""])
+    g = make_generator(client=client)
+    assert g.check_relevance(POST_ECON, "A comment.") is True
+    assert [e["kind"] for e in _evidence(g)] == ["relevance"]
+
+
+def test_an_unparseable_evaluation_keeps_the_reply(make_generator):
+    client = FakeClient(generation_outputs=["not json at all"])
+    g = make_generator(client=client)
+    result = g.evaluate_post_quality({**POST_ECON, "url": "https://example.com/p/1"})
+    assert result["verdict"] == "engage"
+    [evidence] = _evidence(g)
+    assert evidence["kind"] == "evaluate"
+    assert evidence["text_start"] == "not json at all"
+    assert evidence["post_url"] == "https://example.com/p/1"
+
+
+def test_a_fenced_evaluation_is_read_not_defaulted(make_generator):
+    """The exact shape saved from two failed evaluations on 2026-10-31."""
+    client = FakeClient(generation_outputs=[
+        '```json\n{"verdict": "skip", "post_category": "fluff", "reason": "r"}\n```'])
+    g = make_generator(client=client)
+    assert g.evaluate_post_quality(POST_ECON)["verdict"] == "skip"
+    assert _evidence(g) == []
+
+
+def test_an_evaluation_api_error_writes_no_reply_evidence(make_generator):
+    """No reply came back, so there is nothing to keep; the log says why."""
+    class Boom:
+        def complete(self, **k):
+            raise RuntimeError("api down")
+    g = make_generator(client=Boom())
+    assert g.evaluate_post_quality(POST_ECON)["verdict"] == "engage"
+    assert _evidence(g) == []
+
+
 # ─── Prompt reframing ──────────────────────────────────────────────────────────
 
 def test_prompt_includes_on_topic_rules_and_examples(make_generator):
