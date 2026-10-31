@@ -198,6 +198,32 @@ class Completion:
     provider: str
     # True when a chain-of-thought block was stripped out of the raw response.
     reasoning_stripped: bool = False
+    # Why the model stopped, as the vendor reported it ("stop", "length",
+    # "max_tokens"...). None when the response did not say.
+    finish_reason: str = None
+    # Tokens the model spent thinking before it answered, when reported.
+    reasoning_tokens: int = None
+
+
+# ─── Token budget ─────────────────────────────────────────────────────────────
+#
+# Every max_tokens in this project is an ANSWER budget: 100 tokens for a
+# comment, 3 for a YES/NO. Thinking models (Claude's 5-series through
+# OpenRouter, for one) count their reasoning against the same cap, and on that
+# endpoint reasoning cannot be switched off. With a 100-token cap, a model that
+# thought for 100 tokens returned no answer at all, which the comment generator
+# then queued as a blank draft (measured 2026-10-31: 513 reasoning tokens before
+# a 48-token comment). So the adapters add this on top of the caller's budget.
+# Billing is per token generated, so a model that does not think pays nothing
+# for the headroom.
+REASONING_HEADROOM_TOKENS = 2048
+
+
+def answer_budget(max_tokens):
+    """The cap to send for an answer budget of ``max_tokens`` (None stays None)."""
+    if max_tokens is None:
+        return None
+    return max_tokens + REASONING_HEADROOM_TOKENS
 
 
 # ─── Reasoning-output filter ──────────────────────────────────────────────────
@@ -245,6 +271,22 @@ def strip_reasoning(text):
         return text.strip(), False
 
     return cleaned, cleaned != text.strip()
+
+
+_CODE_FENCE = re.compile(r'\A```[a-zA-Z]*\s*\n?(.*?)\n?\s*```\Z', re.DOTALL)
+
+
+def parse_json_reply(text):
+    """``json.loads`` for a model reply, tolerating one markdown code fence.
+
+    Asking for JSON is not a guarantee of bare JSON: Claude through OpenRouter
+    ignores ``response_format`` on some calls and wraps the object in a
+    ```json fence (saved replies, 2026-10-31), which plain json.loads rejects
+    at character 0. Anything else that is not JSON still raises.
+    """
+    stripped = (text or '').strip()
+    match = _CODE_FENCE.match(stripped)
+    return json.loads(match.group(1) if match else stripped)
 
 
 # ─── Paid-call logging ────────────────────────────────────────────────────────
@@ -416,25 +458,32 @@ class OpenAICompatibleProvider(BaseProvider):
                          spec.name, model)
 
         if max_tokens is not None:
-            kwargs[spec.max_tokens_param] = max_tokens
+            kwargs[spec.max_tokens_param] = answer_budget(max_tokens)
 
         if json_object and spec.json_mode == JSON_NATIVE:
             kwargs['response_format'] = {'type': 'json_object'}
 
         response = self._client().chat.completions.create(**kwargs)
-        message = response.choices[0].message
+        choice = response.choices[0]
+        message = choice.message
 
         raw = message.content or ''
-        # Some servers return the chain-of-thought in its own field rather than
-        # inline. Reading content alone is correct there; this is belt and
-        # braces for servers that do both.
-        if getattr(message, 'reasoning_content', None) and not raw.strip():
+        finish_reason = getattr(choice, 'finish_reason', None)
+        details = getattr(getattr(response, 'usage', None), 'completion_tokens_details', None)
+        reasoning_tokens = getattr(details, 'reasoning_tokens', None)
+        # An empty answer is never a result. Say why, so the caller's evidence
+        # names the cause. Some servers return the chain-of-thought in its own
+        # field rather than inline; reading content alone is correct there.
+        if not raw.strip():
             logger.warning(
-                "%s/%s returned only reasoning_content and no answer", spec.name, model)
+                "%s/%s returned no answer text (finish_reason=%s, reasoning_tokens=%s%s)",
+                spec.name, model, finish_reason, reasoning_tokens,
+                ", reasoning_content only" if getattr(message, 'reasoning_content', None) else "")
 
         text, stripped = strip_reasoning(raw)
         return Completion(text=text, model=model, provider=spec.name,
-                          reasoning_stripped=stripped)
+                          reasoning_stripped=stripped, finish_reason=finish_reason,
+                          reasoning_tokens=reasoning_tokens)
 
 
 class AnthropicProvider(BaseProvider):
@@ -468,7 +517,7 @@ class AnthropicProvider(BaseProvider):
             'model': model,
             'system': system,
             'messages': [{'role': 'user', 'content': user}],
-            'max_tokens': max_tokens or self.DEFAULT_MAX_TOKENS,
+            'max_tokens': answer_budget(max_tokens) or self.DEFAULT_MAX_TOKENS,
         }
         if temperature is not None and spec.temperature_allowed(model):
             kwargs['temperature'] = temperature
@@ -483,7 +532,8 @@ class AnthropicProvider(BaseProvider):
         )
         text, stripped = strip_reasoning(raw)
         return Completion(text=text, model=model, provider=spec.name,
-                          reasoning_stripped=stripped)
+                          reasoning_stripped=stripped,
+                          finish_reason=getattr(response, 'stop_reason', None))
 
 
 _ADAPTERS = {
