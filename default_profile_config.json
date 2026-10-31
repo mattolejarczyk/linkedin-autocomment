@@ -67,6 +67,8 @@
       60
     ],
     "stay_on_post_topic": true,
+    "disabled_styles": [],
+    "banned_phrases": [],
     "style_mix": {
       "add_insight": 0.3,
       "share_experience": 0.25,

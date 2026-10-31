@@ -427,6 +427,20 @@ RESPOND WITH JSON:
             }
         }
         
+        # A profile can switch styles off (comment_generator.disabled_styles),
+        # for example the ones that ask for the commenter's own experience or
+        # stance. Switching off every style is a config mistake, not a request
+        # for no comments, so it is reported and ignored.
+        disabled = set(self._profile_list("disabled_styles"))
+        unknown = disabled - set(styles)
+        if unknown:
+            self.logger.warning(f"disabled_styles names unknown styles: {sorted(unknown)}")
+        allowed = {name: data for name, data in styles.items() if name not in disabled}
+        if allowed:
+            styles = allowed
+        else:
+            self.logger.warning("Every comment style is in disabled_styles; ignoring it")
+
         # Match style to post
         post_category = post_eval.get('post_category', 'thought_piece')
         engagement_approach = post_eval.get('engagement_approach', 'add_perspective')
@@ -451,6 +465,11 @@ RESPOND WITH JSON:
         selected_style = random.choice(matching_styles)
         return selected_style, engagement_approach
     
+    def _profile_list(self, key: str) -> List[str]:
+        """A list setting from this profile's comment_generator config, blanks dropped."""
+        cg = (getattr(self, "config", None) or {}).get("comment_generator") or {}
+        return [str(v) for v in (cg.get(key) or []) if str(v).strip()]
+
     def _build_persona_block(self) -> str:
         """Build the persona/tone/voice/topics/avoid/style-mix block from config.
 
@@ -479,6 +498,10 @@ RESPOND WITH JSON:
         avoid = cg.get("things_to_avoid") or []
         if avoid:
             lines.append("AVOID: " + "; ".join(avoid))
+        banned = self._profile_list("banned_phrases")
+        if banned:
+            lines.append("NEVER write these words or phrases; a draft containing any of "
+                         "them is rejected: " + ", ".join(f'"{p}"' for p in banned))
         style_mix = cg.get("style_mix") or {}
         if style_mix:
             mix = ", ".join(
@@ -699,6 +722,15 @@ Write ONLY the {r.action} text:"""
                 issues.append(f"self_positioning_opener: {opener!r}")
                 break
 
+        # RULE 5: phrases this PROFILE bans (comment_generator.banned_phrases).
+        # Whole words or phrases, any case, with a curly apostrophe read as a
+        # straight one, so "I" catches "I'd" and "I'm" but not "AI".
+        normalised = comment.replace("’", "'")
+        for phrase in self._profile_list("banned_phrases"):
+            pattern = r"(?<!\w)" + re.escape(phrase.replace("’", "'")) + r"(?!\w)"
+            if re.search(pattern, normalised, re.IGNORECASE):
+                issues.append(f"profile_banned_phrase: {phrase!r}")
+
         is_authentic = len(issues) == 0
         return is_authentic, issues
     
@@ -739,6 +771,15 @@ Write ONLY the {r.action} text:"""
 
                 # Check authenticity with new detector
                 is_authentic, issues = self.detect_ai_patterns(comment)
+
+                # A banned phrase is never shipped, not even as the fallback
+                # best attempt below: the profile said these words must not be
+                # posted under its name.
+                banned = [i for i in issues if i.startswith("profile_banned_phrase")]
+                if banned:
+                    self._record_reply_failure("banned_phrase", post, completion,
+                                               attempt=attempt + 1, detail="; ".join(banned))
+                    continue
 
                 word_count = len(comment.split())
 

@@ -248,6 +248,82 @@ def test_an_evaluation_api_error_writes_no_reply_evidence(make_generator):
     assert _evidence(g) == []
 
 
+# ─── Profile voice controls: disabled_styles and banned_phrases ───────────────
+
+STANCE_STYLES = ["respectful_different", "empathetic_relate", "practical_helper", "direct_challenge"]
+
+
+def test_disabled_styles_are_never_picked(make_generator):
+    g = make_generator(config={"comment_generator": {"disabled_styles": STANCE_STYLES}})
+    for category in ["personal_story", "question", "thought_piece", "technical_discussion"]:
+        for approach in ["relate_experience", "respectful_disagree", "add_perspective"]:
+            for _ in range(20):
+                style, _ = g.get_matched_comment_style(
+                    {"post_category": category, "engagement_approach": approach})
+                assert style["name"] not in STANCE_STYLES
+
+
+def test_disabling_every_style_is_ignored_not_obeyed(make_generator):
+    every = ["genuine_curious", "thoughtful_addition", "brief_supportive", "direct_reaction",
+             "minimal_agreement", "specific_question"] + STANCE_STYLES
+    g = make_generator(config={"comment_generator": {"disabled_styles": every}})
+    style, _ = g.get_matched_comment_style({"post_category": "thought_piece"})
+    assert style["name"]
+
+
+def _banned(g, text):
+    return [i for i in g.detect_ai_patterns(text)[1] if i.startswith("profile_banned_phrase")]
+
+
+def test_banned_phrases_match_whole_words_in_any_case(make_generator):
+    g = make_generator(config={"comment_generator": {"banned_phrases": ["I", "my worry"]}})
+    assert _banned(g, "I'd want an approval gate there.")
+    assert _banned(g, "Replies reach prospects, so i’m careful there.")   # curly apostrophe
+    assert _banned(g, "My worry is the consent side.")
+    assert _banned(g, "AI tools are useful for research.") == []           # not inside a word
+    assert _banned(g, "Which one did you find hardest to get dependable output from?") == []
+
+
+def test_no_banned_phrases_configured_changes_nothing(make_generator):
+    g = make_generator(config={})
+    assert _banned(g, "I'd want an approval gate there.") == []
+
+
+def test_a_draft_with_a_banned_phrase_is_never_returned(make_generator):
+    """Not even as the fallback best attempt, which used to ship imperfect drafts."""
+    client = FakeClient(generation_outputs=["I'd want one.", "I would too.", "I think so."])
+    g = make_generator(config={"comment_generator": {"banned_phrases": ["I"]}}, client=client)
+
+    assert g.generate_comment(POST_ECON, {"post_category": "thought_piece"}) is None
+    assert client.relevance_calls == 0
+    evidence = _evidence(g)
+    assert [e["kind"] for e in evidence] == ["banned_phrase"] * 3
+    assert evidence[0]["text_start"] == "I'd want one."
+    assert "profile_banned_phrase: 'I'" in evidence[0]["detail"]
+
+
+def test_a_clean_draft_after_a_banned_one_is_used(make_generator, monkeypatch):
+    client = FakeClient(generation_outputs=["I'd want one.", "Which part did you find hardest?"],
+                        relevance_outputs=["YES"])
+    g = make_generator(config={"comment_generator": {"banned_phrases": ["I"]}}, client=client)
+    result = g.generate_comment(POST_ECON, {"post_category": "thought_piece"})
+    assert result["comment"] == "Which part did you find hardest?"
+    assert result["attempt"] == 2
+
+
+def test_banned_phrases_are_named_in_the_prompt(make_generator):
+    g = make_generator(config={"comment_generator": {"banned_phrases": ["I", "my worry"]}})
+    style = {"name": "add_insight", "instruction": "Add a point", "example": "An example."}
+    prompt = g.create_authentic_comment_prompt(POST_ECON, style, "build on idea")
+    assert 'a draft containing any of them is rejected: "I", "my worry"' in prompt
+
+
+def test_default_config_ships_both_lists_empty():
+    import json
+    cg = json.load(open("default_profile_config.json", encoding="utf-8"))["comment_generator"]
+    assert cg["disabled_styles"] == [] and cg["banned_phrases"] == []
+
+
 # ─── Prompt reframing ──────────────────────────────────────────────────────────
 
 def test_prompt_includes_on_topic_rules_and_examples(make_generator):

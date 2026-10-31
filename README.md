@@ -333,6 +333,17 @@ style_mix` into the prompt. The hard comment-style rules (no dash punctuation,
 charming-not-snarky, first-person singular) are always enforced in the generator
 regardless of config. Profiles without a config fall back to defaults.
 
+Two optional lists tighten a profile's voice beyond the prompt, and are enforced
+rather than suggested:
+
+- `comment_generator.disabled_styles`: built-in comment styles the generator
+  never picks (for example `respectful_different`, `empathetic_relate`,
+  `practical_helper`, `direct_challenge`, which ask for the commenter's own
+  experience or stance).
+- `comment_generator.banned_phrases`: whole words or phrases, any case. A draft
+  containing one is regenerated and is never kept as a fallback; each rejected
+  draft is saved to `quality_comments/reply_failures.jsonl`.
+
 ### Human-behavior tuning (`behavior`)
 
 Every script that drives a real LinkedIn session routes its clicks, typing,
