@@ -13,6 +13,7 @@ import random
 import hashlib
 import requests
 from datetime import datetime
+from functools import lru_cache
 from typing import List, Optional, Tuple, Set
 from dataclasses import dataclass, field, asdict
 from enum import Enum
@@ -238,9 +239,38 @@ def classify_ad(author_name: str, text: str, author_profile_url: str,
     return None
 
 
+@lru_cache(maxsize=None)
+def _phrase_pattern(phrase: str) -> "re.Pattern":
+    """Compile ``phrase`` as a whole-word, case-insensitive match.
+
+    A word boundary sits at each end (the ``(?<!\\w)``/``(?!\\w)`` form, so
+    phrases that start or end with punctuation, like "a.i." or "#opentowork",
+    still work). Words inside a phrase may be separated by any whitespace.
+
+    Plural rule: one optional trailing "s" is allowed after a phrase that ends
+    in a letter or digit, so "llm" matches "LLMs" and "intern" matches "interns".
+    Nothing else is: "intern" does not match "internal", "subscribe" does not
+    match "subscribers", "prompt" does not match "prompting". Any other form
+    worth catching needs its own entry in the list.
+    """
+    body = r"\s+".join(re.escape(word) for word in phrase.split())
+    plural = "s?" if phrase[-1:].isalnum() else ""
+    return re.compile(r"(?<!\w)" + body + plural + r"(?!\w)", re.IGNORECASE)
+
+
+def _has_phrase(text: str, phrase: str) -> bool:
+    """True when ``phrase`` appears in ``text`` as whole words (see above)."""
+    return bool(phrase.strip()) and _phrase_pattern(phrase.strip()).search(text) is not None
+
+
 class ContentAnalyzer:
-    """Analyzes content for AI relevance and quality"""
-    
+    """Analyzes content for AI relevance and quality.
+
+    Every indicator list and keyword tier is matched as whole words (see
+    :func:`_phrase_pattern`), never as a bare substring: a substring test let
+    "rag" fire inside "average" and "intern" inside "international".
+    """
+
     def __init__(self, keywords_tier1=None, keywords_tier2=None):
         # AI discussion keywords (prioritizing actual discussions). tier1/tier2
         # may be overridden by the profile config; tier3 keeps the built-in
@@ -337,26 +367,26 @@ class ContentAnalyzer:
         text_lower = text.lower()
         
         # Check for career/personal posts first (to filter out)
-        career_count = sum(1 for indicator in self.career_indicators 
-                          if indicator in text_lower)
+        career_count = sum(1 for indicator in self.career_indicators
+                          if _has_phrase(text_lower, indicator))
         if career_count >= 2:
             return "career"
-        
+
         # Check for spam
-        spam_count = sum(1 for indicator in self.spam_indicators 
-                        if indicator in text_lower)
+        spam_count = sum(1 for indicator in self.spam_indicators
+                        if _has_phrase(text_lower, indicator))
         if spam_count >= 2:
             return "spam"
-        
+
         # Check for discussion posts (what we want)
-        discussion_count = sum(1 for indicator in self.discussion_indicators 
-                             if indicator in text_lower)
+        discussion_count = sum(1 for indicator in self.discussion_indicators
+                             if _has_phrase(text_lower, indicator))
         if discussion_count >= 1:
             return "discussion"
-        
+
         # Check for thought leadership
-        quality_count = sum(1 for indicator in self.quality_indicators 
-                          if indicator in text_lower)
+        quality_count = sum(1 for indicator in self.quality_indicators
+                          if _has_phrase(text_lower, indicator))
         if quality_count >= 1:
             return "thought_leadership"
         
@@ -406,17 +436,17 @@ class ContentAnalyzer:
         
         # Check AI discussion keywords
         for keyword in self.ai_discussion_keywords['tier1']:
-            if keyword in text_lower:
+            if _has_phrase(text_lower, keyword):
                 keywords_found.append(keyword)
                 score += 20
-        
+
         for keyword in self.ai_discussion_keywords['tier2']:
-            if keyword in text_lower:
+            if _has_phrase(text_lower, keyword):
                 keywords_found.append(keyword)
                 score += 10
-        
+
         for keyword in self.ai_discussion_keywords['tier3']:
-            if keyword in text_lower:
+            if _has_phrase(text_lower, keyword):
                 keywords_found.append(keyword)
                 score += 5
         
