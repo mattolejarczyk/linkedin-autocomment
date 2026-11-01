@@ -47,6 +47,7 @@ AGENTS.md
 /HANDOFF.md
 /AUDIT_REPORT.md
 /VISION_AUDIT.md
+/plan-status.json
 
 # ─── Live feed/search HTML dumps (contain personal feed + member content) ─────
 # feed_dump.py / connector_dump.py write these when debugging selectors.
