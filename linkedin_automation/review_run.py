@@ -516,12 +516,16 @@ class ReviewRun:
     def log_outcome(self, rec, outcome, loaded_text=None, final_text=None, reason=None,
                     match=None, evidence=None, last_box_text=None, skip_reason=None,
                     skip_note=None, feedback=None, excerpt=None, said_posted=False,
-                    box_emptied=None):
+                    box_emptied=None, route="review_run", final_text_source=None,
+                    final_vs_draft=None):
         """One line per post: the draft, what was approved, and what was posted."""
         self.tally[outcome] = self.tally.get(outcome, 0) + 1
         entry = {
             "at": datetime.now().isoformat(),
             "run_id": self.run_id,
+            "route": route,
+            "final_text_source": final_text_source,
+            "final_vs_draft": final_vs_draft,
             "url": rec.get("url"),
             "key": rec.get("key"),
             "author": rec.get("author"),
