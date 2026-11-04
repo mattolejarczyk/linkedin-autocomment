@@ -149,6 +149,15 @@
       7
     ]
   },
+  "review": {
+    "human_click_only": false,
+    "daily_limit": 5,
+    "max_draft_age_days": 3,
+    "scan_max_posts": 30,
+    "poll_seconds": 0.75,
+    "posted_confirm_seconds": 20,
+    "min_seconds_between_posts": 20
+  },
   "scheduler": {
     "enabled": false,
     "post_comments": {

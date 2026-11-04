@@ -83,6 +83,7 @@ ACTION_FIRED = "fired"
 ACTION_SKIPPED = "skipped"
 ACTION_QUEUE_EMPTY = "queue_empty"
 ACTION_MISSED = "missed"
+ACTION_REFUSED = "refused"
 
 
 # ─── Config helpers ───────────────────────────────────────────────────────────
@@ -339,6 +340,11 @@ class Scheduler:
 
     def _fire_post_comments(self, profile, job_cfg, now):
         """Post a random count of GENERATED drafts; no-op when the queue is empty."""
+        if pm.human_click_only(profile):
+            logger.warning("Scheduler[%s] post_comments REFUSED: the profile has "
+                           "review.human_click_only set", profile)
+            return {"action": ACTION_REFUSED, "count": 0,
+                    "note": "human_click_only: only the human clicks Comment"}
         store = post_store.load_synced_store(profile)
         generated = store.by_status(post_store.GENERATED)
         if not generated:

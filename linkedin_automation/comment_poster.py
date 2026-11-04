@@ -217,6 +217,7 @@ class LinkedInCommentPoster:
         # Setup directories (profile-specific)
         self.data_dir = pm.get_comments_dir(resolved_name)
         self.progress_file = pm.get_progress_file(resolved_name)
+        self.human_click_only = pm.human_click_only(resolved_name)
         self.screenshots_dir = pm.get_screenshots_dir(resolved_name)
 
         # Apply tunable human-behavior timing (typing speed, reading time, scroll/
@@ -281,6 +282,17 @@ class LinkedInCommentPoster:
             timing.poll(name, declared, actual, outcome)
         else:
             run_log.log_poll("-", name, declared, actual, outcome)
+
+    def refuse_if_human_click_only(self, action):
+        """Stop here if this profile's comments are submitted by the human only.
+
+        Every code path that can submit a comment calls this first. getattr:
+        some callers build the poster without __init__.
+        """
+        if getattr(self, "human_click_only", False):
+            raise pm.HumanClickOnlyRefused(
+                f"Refused to {action}: profile '{self.profile_name}' has "
+                "review.human_click_only set, so only the human clicks Comment.")
 
     def load_progress(self) -> Dict:
         """Load posting progress from file."""
@@ -1390,6 +1402,7 @@ class LinkedInCommentPoster:
 
     def post_comment_ctrl_enter(self, comment_input, comment_text, before=None):
         """Keyboard submit, used as the fallback after a click that did nothing."""
+        self.refuse_if_human_click_only("send the keyboard submit")
         label = "Cmd+Enter" if platform_compat.IS_MACOS else "Ctrl+Enter"
         self.logger.info(f"Falling back to the {label} keyboard submit...")
         try:
@@ -1624,6 +1637,7 @@ class LinkedInCommentPoster:
 
     def post_comment(self, comment_text: str) -> bool:
         """Post a comment on the current post using all available methods."""
+        self.refuse_if_human_click_only("post a comment")
         try:
             # Open comment box
             with self._step("open_composer"):
@@ -1713,6 +1727,7 @@ class LinkedInCommentPoster:
     
     def post_single_comment(self, comment_data: Dict, force: bool = False) -> bool:
         """Post a single comment to LinkedIn."""
+        self.refuse_if_human_click_only("post a comment")
         url = comment_data['url']
         comment_text = comment_data['comment']
         
@@ -1947,6 +1962,8 @@ class LinkedInCommentPoster:
         Opens ``logs/run_<profile>_<ts>.log`` for the length of the run and
         closes it with a RUN summary line, however the run ends (Dispatch 15.1).
         """
+        if not manual_mode:
+            self.refuse_if_human_click_only("start a posting run")
         handler, self.run_log_path = run_log.open_run_log(
             self.profile_name or "default")
         self.run_timing = run_log.RunTiming(self.profile_name)

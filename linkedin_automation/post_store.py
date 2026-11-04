@@ -302,12 +302,61 @@ class PostStore:
         rec["status"] = GENERATED
         rec["trash_reason"] = None
         rec["comment"] = comment
+        rec["draft_original"] = comment
+        rec.pop("needs_check", None)
         rec["comment_meta"] = meta or {}
         rec["generated_at"] = _now()
         # A freshly-generated draft has not been reviewed, even if an older draft
         # for the same post had been — otherwise a regenerated comment would skip
         # the Review step silently.
         rec["reviewed_at"] = None
+        rec["updated_at"] = _now()
+        if save:
+            self.save()
+        return True
+
+    @staticmethod
+    def _keep_draft_original(rec: Dict):
+        """Keep the first draft before its text is replaced. Older records have
+        no ``draft_original`` yet, so it is filled here on first overwrite."""
+        if not rec.get("draft_original") and rec.get("comment"):
+            rec["draft_original"] = rec["comment"]
+
+    def set_final_comment(self, key_or_url: str, final_text: str,
+                          save: bool = False) -> bool:
+        """Record the text a human actually posted, keeping the original draft."""
+        rec = self._resolve(key_or_url)
+        if rec is None or not (final_text or "").strip():
+            return False
+        self._keep_draft_original(rec)
+        rec["comment"] = final_text
+        rec["updated_at"] = _now()
+        if save:
+            self.save()
+        return True
+
+    def mark_needs_check(self, key_or_url: str, reason: str,
+                         save: bool = False) -> bool:
+        """Hold a GENERATED draft back from the review queue until a human looks.
+
+        Used when a review run cannot tell whether a comment was posted. It may
+        be on LinkedIn already, so offering it again risks a duplicate comment.
+        """
+        rec = self._resolve(key_or_url)
+        if rec is None or rec.get("status") != GENERATED:
+            return False
+        rec["needs_check"] = reason
+        rec["updated_at"] = _now()
+        if save:
+            self.save()
+        return True
+
+    def clear_needs_check(self, key_or_url: str, save: bool = False) -> bool:
+        """Put a held draft back in the review queue."""
+        rec = self._resolve(key_or_url)
+        if rec is None or "needs_check" not in rec:
+            return False
+        rec.pop("needs_check")
         rec["updated_at"] = _now()
         if save:
             self.save()
@@ -364,6 +413,7 @@ class PostStore:
         if rec is None or rec.get("status") != GENERATED:
             return False
         if comment is not None and comment.strip():
+            self._keep_draft_original(rec)
             rec["comment"] = comment
         rec["reviewed_at"] = _now()
         rec["updated_at"] = _now()
@@ -557,6 +607,33 @@ class PostStore:
         if include_reviewed:
             return recs
         return [r for r in recs if not r.get("reviewed_at")]
+
+    def review_ready(self, max_age_days: float = None, now: datetime = None,
+                     approved_only: bool = False) -> List[Dict]:
+        """Drafts a human could review now, highest relevance first.
+
+        GENERATED with a URL, not held by :meth:`mark_needs_check`, and drafted
+        within ``max_age_days``. A draft whose date cannot be read is left out
+        rather than assumed fresh. ``approved_only`` keeps those already approved
+        on the review screen.
+        """
+        now = now or datetime.now()
+        ready = []
+        for rec in self.by_status(GENERATED):
+            if not rec.get("url") or rec.get("needs_check"):
+                continue
+            if approved_only and not rec.get("reviewed_at"):
+                continue
+            if max_age_days is not None:
+                try:
+                    drafted = datetime.fromisoformat(rec.get("generated_at") or "")
+                except ValueError:
+                    continue
+                if (now - drafted).total_seconds() > max_age_days * 86400:
+                    continue
+            ready.append(rec)
+        ready.sort(key=lambda r: r.get("relevance_score", 0) or 0, reverse=True)
+        return ready
 
     def reviewed_count(self) -> int:
         """GENERATED drafts the user has already approved but not yet posted.
@@ -857,6 +934,42 @@ def backfill_evaluator_rejected(profile_name: str = None, store: PostStore = Non
         logger.info("backfill_evaluator_rejected(%s): moved %d NEW -> TRASH(%s)",
                     profile_name, len(affected), REASON_EVALUATOR_REJECTED)
     return affected
+
+
+def write_generator_input(profile_name, records):
+    """Serialize NEW records to a generator-shaped input JSON file.
+
+    The generator reads ``{"quality_posts": [...]}`` with per-post ``url`` /
+    ``text`` / ``author_name`` keys, then marks each commented post GENERATED in
+    the same store (by URL). Only URL-bearing records are written: a post with no
+    URL can't be commented on or posted, so it stays NEW.
+
+    Returns ``(path, count)``.
+    """
+    from . import profile_manager as pm
+
+    quality_posts = []
+    for r in records:
+        if not r.get("url"):
+            continue
+        quality_posts.append({
+            "url": r["url"],
+            "text": r.get("text", ""),
+            "author_name": r.get("author", ""),
+            "relevance_score": r.get("relevance_score", 0),
+            "post_type": r.get("category", ""),
+            "should_engage": True,
+        })
+    timeline_dir = pm.get_timeline_dir(profile_name)
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    path = os.path.join(timeline_dir, f'lifecycle_new_{ts}.json')
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump({
+            "source": "lifecycle_store",
+            "generated_at": datetime.now().isoformat(),
+            "quality_posts": quality_posts,
+        }, f, indent=2, ensure_ascii=False)
+    return path, len(quality_posts)
 
 
 def load_synced_store(profile_name: str = None, migrate_if_empty: bool = True,

@@ -71,6 +71,11 @@ class LoginRequiredError(RuntimeError):
     """
 
 
+class HumanClickOnlyRefused(RuntimeError):
+    """Raised when code tries to submit a comment on a profile whose config says
+    only the human may click Comment (``review.human_click_only``)."""
+
+
 class ProductionAccessRefused(RuntimeError):
     """Raised when a browser-driving entry point would act as a declared
     PRODUCTION LinkedIn identity (or an identity that cannot be resolved at
@@ -562,6 +567,46 @@ def save_profile_config(profile_name: str, config: Dict):
     with open(tmp_path, 'w', encoding='utf-8') as f:
         json.dump(config, f, indent=2)
     os.replace(tmp_path, path)
+
+
+#: The ``review`` block of a profile config, for keys the profile does not set.
+REVIEW_DEFAULTS = {
+    "human_click_only": False,
+    "daily_limit": 5,
+    "max_draft_age_days": 3,
+    "scan_max_posts": 30,
+    "poll_seconds": 0.75,
+    "posted_confirm_seconds": 20,
+    "min_seconds_between_posts": 20,
+}
+
+
+def get_review_settings(profile_name: str = None) -> Dict:
+    """The profile's ``review`` settings, with defaults for anything unset."""
+    stored = get_profile_config(profile_name).get("review") or {}
+    return {**REVIEW_DEFAULTS, **stored}
+
+
+def human_click_only(profile_name: str = None) -> bool:
+    """May code submit comments on this profile? True means it may NOT.
+
+    Reads the stored file rather than get_profile_config, which falls back to
+    the default template on a corrupt file. That would quietly switch this guard
+    off, so an unreadable config answers True: refuse, and say why.
+    """
+    path = get_config_path(profile_name)
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            stored = json.load(f)
+        if not isinstance(stored, dict):
+            raise ValueError("config is not a JSON object")
+    except (OSError, ValueError) as e:
+        logger.warning("profile_config.json unreadable (%s); treating the "
+                       "profile as human_click_only", e)
+        return True
+    return bool((stored.get("review") or {}).get("human_click_only"))
 
 
 def read_stored_config(profile_name: str = None) -> Dict:
