@@ -134,6 +134,10 @@ def test_the_moment_is_asked_at_most_twice(make):
     assert len(client.moment_calls) == 2
 
 
+def test_company_funding_news_is_a_win_even_written_as_we():
+    assert "funding news counts, even written as we" in mr.BY_CODE[mr.WIN].spot
+
+
 def test_the_list_puts_the_funnel_first_and_business_last():
     codes = [m.code for m in mr._MOMENTS]
     assert codes[0] == mr.LEAD_FUNNEL and codes[-1] == mr.BUSINESS

@@ -70,7 +70,8 @@ _MOMENTS = (
            max_exclamations=1),
     Moment(WIN,
            "Their own milestone, told personally: a launch, new role, funding, award, "
-           "anniversary or book. Words like finally, today I'm, proud. Not a post whose point "
+           "anniversary or book. Words like finally, today I'm, proud. Their company's funding "
+           "news counts, even written as we. Not a post whose point "
            "is selling or showing off a tool, a result or a method, even one that says I built "
            "or brags about a number: that is business.",
            does="Congratulate them and name the thing. One or two short, warm sentences. You "
