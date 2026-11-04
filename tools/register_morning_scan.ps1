@@ -9,14 +9,34 @@
 # -AllowProduction lets the scan run unattended against a declared production
 # identity. Leave it off and the scan refuses that identity, which shows up as
 # FAILED / production_access_refused in review_status.json.
+#
+# -ShowStartTime prints the start time that would be stored and registers nothing.
 param(
   [Parameter(Mandatory = $true)][string]$ProfileName,
   [string]$At = "07:30",
   [switch]$Weekdays,
   [switch]$AllowProduction,
+  [switch]$ShowStartTime,
   [string]$TaskName = "LinkedIn Morning Scan - $ProfileName"
 )
 $ErrorActionPreference = "Stop"
+
+function New-LocalTimeTrigger {
+  if ($Weekdays) {
+    $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday, Tuesday, Wednesday, Thursday, Friday -At $At
+  } else {
+    $trigger = New-ScheduledTaskTrigger -Daily -At $At
+  }
+  # Plain local clock time. Left as it comes, the start time carries a UTC offset
+  # and the task runs an hour off once the clocks change.
+  $trigger.StartBoundary = ([datetime]$At).ToString("yyyy-MM-ddTHH:mm:ss")
+  return $trigger
+}
+
+if ($ShowStartTime) {
+  Write-Output (New-LocalTimeTrigger).StartBoundary
+  return
+}
 
 $root = Split-Path -Parent $PSScriptRoot
 $python = Join-Path $root ".venv\Scripts\python.exe"
@@ -26,11 +46,7 @@ $arguments = "-m linkedin_automation.morning_scan --profile `"$ProfileName`""
 if ($AllowProduction) { $arguments += " --allow-production" }
 
 $action = New-ScheduledTaskAction -Execute $python -Argument $arguments -WorkingDirectory $root
-if ($Weekdays) {
-  $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday, Tuesday, Wednesday, Thursday, Friday -At $At
-} else {
-  $trigger = New-ScheduledTaskTrigger -Daily -At $At
-}
+$trigger = New-LocalTimeTrigger
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 45)
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive
 

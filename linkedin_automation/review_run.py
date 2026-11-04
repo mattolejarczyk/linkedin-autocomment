@@ -54,6 +54,34 @@ OPENER_SELECTOR = "button[aria-label='%s']" % LinkedInCommentPoster.SUBMIT_BUTTO
 MATCH_PREFIX_CHARS = 80
 
 
+#: Why a post was skipped: (code, what the dropdown shows, stays in the queue).
+#: Only "not now" comes back. The rest leave the queue through the store's normal
+#: reject, so they can be restored from the Trash view.
+SKIP_REASONS = (
+    ("not_relevant", "Post isn't relevant to me", False),
+    ("sales_pitch", "Post is a sales pitch I don't want to engage with", False),
+    ("draft_not_me", "Draft doesn't sound like me", False),
+    ("draft_misses_point", "Draft misses the point of the post", False),
+    ("author", "Don't want to engage with this author", False),
+    ("not_now", "Not now, show me this again later", True),
+    ("other", "Other (type your reason)", False),
+)
+OTHER_REASON = "other"
+
+
+def skip_reason_problem(code, note=None):
+    """What is wrong with this skip reason, or None if it is acceptable."""
+    if code not in {c for c, _, _ in SKIP_REASONS}:
+        return "Choose a reason from the list."
+    if code == OTHER_REASON and not (note or "").strip():
+        return "Type your reason."
+    return None
+
+
+def skip_keeps_in_queue(code) -> bool:
+    return any(c == code and keep for c, _, keep in SKIP_REASONS)
+
+
 def normalize(text) -> str:
     return " ".join((text or "").split())
 
@@ -66,7 +94,7 @@ class ReviewControl:
     """Skip / Stop requests from the control window, and progress for it to show."""
 
     def __init__(self):
-        self._skip = threading.Event()
+        self._skip = None
         self._stop = threading.Event()
         self.done = threading.Event()
         self.position = 0
@@ -74,18 +102,20 @@ class ReviewControl:
         self.author = ""
         self.message = "Starting..."
 
-    def request_skip(self):
-        self._skip.set()
+    def request_skip(self, reason, note=None):
+        """Ask to skip this post. A skip always carries a reason."""
+        problem = skip_reason_problem(reason, note)
+        if problem:
+            raise ValueError(problem)
+        self._skip = {"code": reason, "note": (note or "").strip() or None}
 
     def request_stop(self):
         self._stop.set()
 
-    def take_skip(self) -> bool:
-        """True once per Skip press."""
-        if self._skip.is_set():
-            self._skip.clear()
-            return True
-        return False
+    def take_skip(self):
+        """The reason given, once per Skip. None if no skip is waiting."""
+        skip, self._skip = self._skip, None
+        return skip
 
     @property
     def stop_requested(self) -> bool:
@@ -232,8 +262,10 @@ def wait_for_human(reader, control, draft, poll_seconds=0.75, confirm_seconds=20
         if control.stop_requested:
             return {"outcome": SKIPPED, "final_text": None, "reason": "stopped",
                     "last_box_text": watcher.last_text}
-        if control.take_skip():
+        skip = control.take_skip()
+        if skip:
             return {"outcome": SKIPPED, "final_text": None, "reason": "skipped",
+                    "skip_reason": skip["code"], "skip_note": skip["note"],
                     "last_box_text": watcher.last_text}
 
         result = watcher.observe(reader.box_text(), reader.thread())
@@ -270,7 +302,8 @@ class ReviewRun:
         return os.path.join(pm.get_data_dir(self.profile_name), LOG_FILE)
 
     def log_outcome(self, rec, outcome, loaded_text=None, final_text=None, reason=None,
-                    match=None, evidence=None, last_box_text=None):
+                    match=None, evidence=None, last_box_text=None, skip_reason=None,
+                    skip_note=None):
         """One line per post: the draft, what was approved, and what was posted."""
         self.tally[outcome] = self.tally.get(outcome, 0) + 1
         entry = {
@@ -286,6 +319,8 @@ class ReviewRun:
             "last_box_text": last_box_text,
             "outcome": outcome,
             "reason": reason,
+            "skip_reason": skip_reason,
+            "skip_note": skip_note,
             "thread_match": match,
             "evidence": evidence,
         }
@@ -375,8 +410,14 @@ class ReviewRun:
         elif outcome == SKIPPED:
             self.log_outcome(logged, SKIPPED, loaded_text=loaded_text,
                              reason=result.get("reason"),
+                             skip_reason=result.get("skip_reason"),
+                             skip_note=result.get("skip_note"),
                              last_box_text=result.get("last_box_text"))
             self._clear_box_for_leaving()
+            # A Stop has no reason and stays queued, as does "not now".
+            code = result.get("skip_reason")
+            if code and not skip_keeps_in_queue(code):
+                self.store.reject(rec["key"], save=True)
         else:
             # Could not tell. It may be on LinkedIn, so it is held back rather
             # than offered again, and a human settles it with --mark-commented
@@ -497,6 +538,23 @@ class ReviewRun:
             return True
 
 
+def _console_skip(control):
+    """Ask for the reason a skip needs. Anything invalid cancels the skip."""
+    for number, (_, label, _) in enumerate(SKIP_REASONS, 1):
+        print(f"  {number}. {label}")
+    try:
+        code = SKIP_REASONS[int(input("Why skip? Number: ").strip()) - 1][0]
+    except (ValueError, IndexError):
+        print("Not skipped: choose a number from the list.")
+        return
+    note = input("Your reason: ") if code == OTHER_REASON else None
+    problem = skip_reason_problem(code, note)
+    if problem:
+        print(f"Not skipped: {problem}")
+        return
+    control.request_skip(code, note)
+
+
 def _console_control(control):
     """Skip and Stop from the console, for when no window can be shown."""
     def read():
@@ -504,7 +562,7 @@ def _console_control(control):
         for line in sys.stdin:
             answer = line.strip().lower()
             if answer == "s":
-                control.request_skip()
+                _console_skip(control)
             elif answer == "q":
                 control.request_stop()
                 return

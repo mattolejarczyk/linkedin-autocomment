@@ -34,8 +34,11 @@ python -m linkedin_automation.review_run --profile <name>
 | `--mark-commented URL` | Record a comment you posted by hand. No browser |
 | `--release KEY` | Put a held draft back in the queue. No browser |
 
-The small always-on-top window shows where you are, with Skip and Stop. The browser
-closes at the end. The run ends with HEALTHY, DEGRADED or FAILED, in its output and
+The small always-on-top window shows where you are, with Skip and Stop. Skip asks
+why: pick a reason from the list, or choose Other and type your own. A skip with no
+reason is refused. "Not now" stays in the queue; every other reason moves the draft
+to the Trash view, where it can be restored. Stop needs no reason and keeps the draft
+queued. The browser closes at the end. The run ends with HEALTHY, DEGRADED or FAILED, in its output and
 exit code (0, 2, 1).
 
 ## How it sees your click
@@ -50,9 +53,9 @@ already be on LinkedIn.
 ## What gets logged
 
 `data/<profile>/review_log.jsonl`, one line per post: `draft_original`,
-`approved_text`, `loaded_text`, `final_text`, and an `outcome` of `posted_as_is`,
-`posted_edited`, `skipped`, `unknown`, `failed`, `unavailable` or
-`already_commented`. Failures name their evidence file.
+`approved_text`, `loaded_text`, `final_text`, `skip_reason`, `skip_note`, and an
+`outcome` of `posted_as_is`, `posted_edited`, `skipped`, `unknown`, `failed`,
+`unavailable` or `already_commented`. Failures name their evidence file.
 
 The log never changes a persona or voice setting.
 
