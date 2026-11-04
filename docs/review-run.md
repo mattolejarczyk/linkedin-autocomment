@@ -37,15 +37,35 @@ python -m linkedin_automation.review_run --profile <name>
 The small always-on-top window shows where you are, with Skip and Stop. Skip asks
 why: pick a reason from the list, or choose Other and type your own. A skip with no
 reason is refused. "Not now" stays in the queue; every other reason moves the draft
-to the Trash view, where it can be restored. Stop needs no reason and keeps the draft
-queued. The browser closes at the end. The run ends with HEALTHY, DEGRADED or FAILED, in its output and
+to the Trash view, where it can be restored.
+
+**I posted it** moves on when the run has not noticed your click. It records that you
+said so and marks the post as commented, so it is not offered again. It clicks
+nothing. It still looks for your text on the page, and logs `posted_on_their_word`
+with no final text if it cannot see it.
+
+**Stop** ends the run. If the current post has no decision yet, you may have clicked
+Comment, so it is logged `unknown`, its page is saved, and the draft is held until you
+settle it with `--mark-commented` or `--release`.
+
+The panel also has a box for your own words, kept exactly as you type them. Mark them
+as a direction ("this is too negative, find a point of agreement first") or as your
+own version of the comment. **Use this** puts your own version in LinkedIn's box and
+does not skip. You still read it and click Comment. A direction, or a version you
+skip with, is only logged.
+
+The browser closes at the end. The run ends with HEALTHY, DEGRADED or FAILED, in its output and
 exit code (0, 2, 1).
 
 ## How it sees your click
 
 It reads the page about once a second and changes nothing. A comment counts as
 posted when the box is empty or gone and the last text seen in the box is in the
-thread. If the box empties and the thread changes but the text cannot be found, the
+thread, or anywhere on the page if no comment selector matches. A comment changed
+after the run last looked at the box still counts, but `final_text` is then the last
+text it saw, so read `page_excerpt` beside it: that is what the page showed. Each post's page is
+saved the moment its box first empties, and `data/<profile>/review_trace/` records
+what the run saw as it waited. If the box empties and the thread changes but the text cannot be found, the
 outcome is `unknown`, never a guess. An unknown draft is held back and not offered
 again until you settle it with `--mark-commented` or `--release`, because it may
 already be on LinkedIn.
@@ -53,8 +73,9 @@ already be on LinkedIn.
 ## What gets logged
 
 `data/<profile>/review_log.jsonl`, one line per post: `draft_original`,
-`approved_text`, `loaded_text`, `final_text`, `skip_reason`, `skip_note`, and an
-`outcome` of `posted_as_is`, `posted_edited`, `skipped`, `unknown`, `failed`,
+`approved_text`, `loaded_text`, `final_text`, `skip_reason`, `skip_note`,
+`feedback_type` (`direction` or `my_version`), `feedback_text`, `feedback_reason`,
+`feedback_used_in_box`, and an `outcome` of `posted_as_is`, `posted_on_their_word`, `posted_edited`, `skipped`, `unknown`, `failed`,
 `unavailable` or `already_commented`. Failures name their evidence file.
 
 The log never changes a persona or voice setting.
