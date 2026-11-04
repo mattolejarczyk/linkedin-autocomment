@@ -197,6 +197,12 @@ class LinkedInCommentPoster:
     # branch: it turns every posted comment into a reported failure.
     POSTED_COMMENT_SELECTOR = "div.comments-comment-item"
 
+    # Some accounts get a different permalink page: on a live capture from
+    # 2026-11-03 neither that selector nor the commentList hook below matched once,
+    # with sixteen comments on screen, so the thread read as empty. A review run
+    # then waited forever for a comment that had already posted.
+    POSTED_COMMENT_ENTITY_SELECTOR = "article.comments-comment-entity"
+
     # The live hook. The comment list carries a data-testid ending in
     # "-commentList" (the prefix is per-post), and its children are the
     # rendered comments plus some chrome. Counting children is a GROWTH signal
@@ -1064,6 +1070,17 @@ class LinkedInCommentPoster:
             items = []
         if items:
             return (len(items), _texts(items))
+
+        # The other per-comment hook. count=None for the reason given further down:
+        # comments and replies load as the page scrolls, so a higher count here would
+        # not show that ours landed. The text match is the proof.
+        try:
+            items = self.driver.find_elements(
+                By.CSS_SELECTOR, self.POSTED_COMMENT_ENTITY_SELECTOR)
+        except Exception:
+            items = []
+        if items:
+            return (None, _texts(items))
 
         # Otherwise the list container, whose children are the comments plus
         # some chrome. The child COUNT is only a growth signal; the container's

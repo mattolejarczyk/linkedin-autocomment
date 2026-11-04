@@ -527,7 +527,7 @@ class ReviewRun:
             self.log_outcome(logged, FAILED, reason="no_draft_text")
             return
 
-        if not poster.navigate_to_post(url):
+        if not poster.navigate_to_post(url) and not self._usable_though_slow(url):
             nav = getattr(poster, "last_navigation", None) or {}
             if nav.get("outcome") == poster.NAV_UNAVAILABLE:
                 poster.record_unavailable(url, nav.get("reason"))
@@ -587,6 +587,20 @@ class ReviewRun:
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps({"at": datetime.now().isoformat(), "url": url, **seen},
                                ensure_ascii=False) + "\n")
+
+    def _usable_though_slow(self, url) -> bool:
+        """A page past its load limit can still be fully usable.
+
+        LinkedIn's load event can arrive well after the post and comment box are on
+        screen. With a human waiting to read it, that is no reason to give up: the
+        first live timeout was on a page showing the post, the box and the thread.
+        """
+        poster = self.poster
+        nav = getattr(poster, "last_navigation", None) or {}
+        if nav.get("outcome") != poster.NAV_TIMEOUT or not poster.post_content_present():
+            return False
+        logger.info("Page load limit passed but the post is on screen; carrying on: %s", url)
+        return True
 
     def _put_in_box(self, text) -> bool:
         """Replace the box's text with the human's own wording. Never submits.
