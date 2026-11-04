@@ -512,10 +512,11 @@ class Reader:
 
 def test_wait_returns_on_skip():
     control = rr.ReviewControl()
-    control.request_skip()
+    control.request_skip("draft_not_me")
     result = rr.wait_for_human(Reader([(DRAFT, THREAD)]), control, DRAFT, poll_seconds=0)
     assert result["outcome"] == rr.SKIPPED and result["reason"] == "skipped"
-    assert control.take_skip() is False          # one press, one skip
+    assert result["skip_reason"] == "draft_not_me"
+    assert control.take_skip() is None           # one press, one skip
 
 
 def test_wait_returns_on_stop():
@@ -590,9 +591,9 @@ def test_approved_only_ignores_unapproved_drafts(env):
     assert env.quit_called is False           # nothing to do, no browser
 
 
-def test_skip_stays_queued_clears_the_box_and_moves_on(env):
+def test_not_now_stays_queued_clears_the_box_and_moves_on(env):
     control = rr.ReviewControl()
-    env.human = [lambda page: control.request_skip(), FakePage.clicks_comment]
+    env.human = [lambda page: control.request_skip("not_now"), FakePage.clicks_comment]
     _seed(URL, score=90)
     _seed(URL2, comment="A different draft comment, long enough to find in the thread.",
           score=10)
@@ -603,6 +604,145 @@ def test_skip_stays_queued_clears_the_box_and_moves_on(env):
     assert _rec(URL)["status"] == post_store.GENERATED
     assert _rec(URL2)["status"] == post_store.COMMENTED
     assert env.submit.clicks == 0
+
+
+def test_a_skip_cannot_be_requested_without_a_reason():
+    control = rr.ReviewControl()
+    with pytest.raises(TypeError):
+        control.request_skip()
+    for code, note in ((None, None), ("", None), ("made_up", None), ("other", None),
+                       ("other", "   ")):
+        with pytest.raises(ValueError):
+            control.request_skip(code, note)
+    assert control.take_skip() is None
+
+
+def test_every_listed_reason_but_other_is_enough_alone():
+    for code, _, _ in rr.SKIP_REASONS:
+        expected = None if code != rr.OTHER_REASON else "Type your reason."
+        assert rr.skip_reason_problem(code) == expected
+    assert rr.skip_reason_problem(rr.OTHER_REASON, "My own words") is None
+
+
+def test_free_text_reason_is_logged_word_for_word(env):
+    control = rr.ReviewControl()
+    env.human = [lambda page: control.request_skip("other", "  Already replied by DM  ")]
+    _seed()
+    rr.ReviewRun(PROFILE, control=control).run()
+    entry = _log()[-1]
+    assert entry["outcome"] == rr.SKIPPED
+    assert entry["skip_reason"] == "other"
+    assert entry["skip_note"] == "Already replied by DM"
+    assert env.submit.clicks == 0
+
+
+def test_a_reason_other_than_not_now_takes_it_out_of_the_queue(env):
+    control = rr.ReviewControl()
+    env.human = [lambda page: control.request_skip("draft_not_me")]
+    _seed()
+    rr.ReviewRun(PROFILE, control=control).run()
+    assert _log()[-1]["skip_reason"] == "draft_not_me"
+    rec = _rec()
+    assert rec["status"] == post_store.TRASH
+    assert rec["draft_original"] == DRAFT
+    assert rs.read_status(PROFILE)["ready"] == 0
+
+
+def test_not_now_is_logged_and_offered_again(env):
+    control = rr.ReviewControl()
+    env.human = [lambda page: control.request_skip("not_now")]
+    _seed()
+    rr.ReviewRun(PROFILE, control=control).run()
+    assert _log()[-1]["skip_reason"] == "not_now"
+    assert _rec()["status"] == post_store.GENERATED
+    assert rs.read_status(PROFILE)["ready"] == 1
+
+
+def test_stop_needs_no_reason_and_stays_queued(env):
+    control = rr.ReviewControl()
+    env.human = [lambda page: control.request_stop()]
+    _seed()
+    rr.ReviewRun(PROFILE, control=control).run()
+    entry = _log()[-1]
+    assert entry["reason"] == "stopped" and entry["skip_reason"] is None
+    assert _rec()["status"] == post_store.GENERATED
+
+
+@pytest.mark.parametrize("answers, expected", [
+    (["2"], {"code": "sales_pitch", "note": None}),
+    ([str(len(rr.SKIP_REASONS)), "My own words"], {"code": "other", "note": "My own words"}),
+    ([str(len(rr.SKIP_REASONS)), "   "], None),
+    (["99"], None),
+    (["nope"], None),
+])
+def test_console_skip_also_requires_a_reason(monkeypatch, answers, expected):
+    replies = iter(answers)
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(replies))
+    control = rr.ReviewControl()
+    rr._console_skip(control)
+    assert control.take_skip() == expected
+
+
+# ─── The skip window ──────────────────────────────────────────────────────────
+
+# In a child process on purpose. Tk objects belong to the thread that made them,
+# and garbage collected later on another thread they abort the whole interpreter,
+# which took the rest of the test suite down with no summary line.
+WINDOW_CHECK = """
+import sys, tkinter
+from linkedin_automation import review_run as rr, review_window
+
+control = rr.ReviewControl()
+try:
+    win = review_window.ReviewWindow(control)
+except tkinter.TclError as exc:
+    print("NO DISPLAY", exc)
+    sys.exit(0)
+win.root.withdraw()
+labels = dict((c, l) for c, l, _ in rr.SKIP_REASONS)
+first_code, first_label, _ = rr.SKIP_REASONS[0]
+
+assert list(win.dropdown["values"]) == [l for _, l, _ in rr.SKIP_REASONS]
+
+win.open_skip_panel()
+assert control.take_skip() is None, "pressing Skip alone must not skip"
+
+win.confirm_skip()
+assert control.take_skip() is None and win.problem.get(), "no reason must be refused"
+
+win.reason.set(first_label)
+win.cancel_skip()
+assert control.take_skip() is None, "cancel must not skip"
+assert win.panel_open is False and win.reason.get() == ""
+
+win.open_skip_panel()
+win.reason.set(first_label)
+win.confirm_skip()
+assert control.take_skip() == {"code": first_code, "note": None}
+assert win.panel_open is False
+
+win.open_skip_panel()
+win.reason.set(labels[rr.OTHER_REASON])
+win.confirm_skip()
+assert control.take_skip() is None, "Other with no text must be refused"
+win.note.set("My own words")
+win.confirm_skip()
+assert control.take_skip() == {"code": rr.OTHER_REASON, "note": "My own words"}
+
+control.done.set()
+win.refresh()
+print("WINDOW OK")
+"""
+
+
+def test_skip_window_requires_a_reason():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(cpm.__file__)))
+    result = subprocess.run([sys.executable, "-c", WINDOW_CHECK], cwd=root,
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+    if "NO DISPLAY" in result.stdout:
+        pytest.skip(result.stdout)
+    assert "WINDOW OK" in result.stdout
 
 
 def test_unknown_is_held_back_with_evidence_named(env):

@@ -17,6 +17,7 @@ patched out, and nothing binds a port.
 import os
 import subprocess
 import sys
+import threading
 
 import pytest
 
@@ -26,13 +27,22 @@ from linkedin_automation import restart_helper as rh
 
 @pytest.fixture(autouse=True)
 def never_actually_exit(monkeypatch):
-    """os._exit in a test run would take pytest with it."""
+    """os._exit in a test run would take pytest with it.
+
+    The endpoint exits from a background thread, so the patch has to outlive that
+    thread. Undone first, a thread that lost the race called the real os._exit(0):
+    pytest vanished mid-run with exit code 0, no summary, and the rest of the
+    suite never run, which reads as a pass.
+    """
     exits = []
     monkeypatch.setattr(dash.os, "_exit", lambda code: exits.append(code))
     # Shorten the grace period rather than patching time.sleep, which is the
     # shared module and would also disable this test's own waiting loop.
     monkeypatch.setattr(dash, "RESTART_GRACE_SECONDS", 0)
-    return exits
+    before = set(threading.enumerate())
+    yield exits
+    for thread in set(threading.enumerate()) - before:
+        thread.join(timeout=5)
 
 
 @pytest.fixture(autouse=True)
