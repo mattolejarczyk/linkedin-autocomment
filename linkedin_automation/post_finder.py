@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import random
+import time
 import hashlib
 import requests
 from datetime import datetime
@@ -777,6 +778,24 @@ class LinkedInScraper:
             return None
         return clip.split("?")[0]  # strip tracking query params
 
+    #: Cap on waiting for the overflow menu to finish loading.
+    COPY_LINK_WAIT_SECONDS = 10.0
+    COPY_LINK_POLL_SECONDS = 0.4
+
+    def _await_copy_link_item(self):
+        """The "Copy link to post" menu item once it is on screen, or None at the cap."""
+        deadline = time.time() + self.COPY_LINK_WAIT_SECONDS
+        while True:
+            for it in self.driver.find_elements(By.CSS_SELECTOR, self.MENU_ITEM_SELECTORS):
+                try:
+                    if self.COPY_LINK_TEXT in (it.text or "").strip().lower():
+                        return it
+                except Exception:
+                    continue
+            if time.time() >= deadline:
+                return None
+            time.sleep(self.COPY_LINK_POLL_SECONDS)
+
     def extract_url_via_clipboard(self, element) -> Optional[str]:
         """Resolve a post's permalink via "..." menu -> "Copy link to post".
 
@@ -804,18 +823,14 @@ class LinkedInScraper:
             hb.human_click(self.driver, menu_btn)
             hb.human_sleep(0.9, 1.5)
 
-            # Find the "Copy link to post" item by visible text.
-            copy_item = None
-            for it in self.driver.find_elements(By.CSS_SELECTOR, self.MENU_ITEM_SELECTORS):
-                try:
-                    if self.COPY_LINK_TEXT in (it.text or "").strip().lower():
-                        copy_item = it
-                        break
-                except Exception:
-                    continue
-
+            # WAIT for the "Copy link to post" item. The menu loads on demand: a live
+            # capture shows a spinner where the menu should be, and looking only once
+            # threw away the best post of that scan.
+            copy_item = self._await_copy_link_item()
             if copy_item is None:
-                self.logger.debug("No 'Copy link to post' menu item found")
+                self.logger.warning(
+                    "No 'Copy link to post' item within %.0fs of opening the menu",
+                    self.COPY_LINK_WAIT_SECONDS)
                 self._dismiss()
                 return None
 

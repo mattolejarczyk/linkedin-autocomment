@@ -590,6 +590,9 @@ class Reader:
     def page_text(self):
         return None
 
+    def comment_items(self):
+        return None
+
     def left_the_post(self):
         return self.left
 
@@ -808,9 +811,11 @@ def test_i_posted_it_finds_the_text_even_if_linkedin_left_it_in_the_box(env):
         control.say_posted()
     env.human = [posted_box_still_full]
     _seed()
-    assert rr.ReviewRun(PROFILE, control=control).run() == rs.HEALTHY
+    # DEGRADED: the comment is fine, but the run needed telling.
+    assert rr.ReviewRun(PROFILE, control=control).run() == rs.DEGRADED
     entry = _log()[-1]
-    assert entry["outcome"] == rr.POSTED_AS_IS and entry["final_text"] == DRAFT
+    assert entry["outcome"] == rr.POSTED_ON_THEIR_WORD and entry["final_text"] == DRAFT
+    assert entry["evidence"] and os.path.exists(entry["evidence"])
     assert _rec()["status"] == post_store.COMMENTED
 
 
@@ -934,6 +939,91 @@ def test_duplicate_check_works_on_that_page(env):
     rr.ReviewRun(PROFILE).run()
     assert _log()[-1]["outcome"] == rr.ALREADY_COMMENTED
     assert env.box.keys == []
+
+
+def _posts_but_box_stays_full(comments):
+    def act(page):
+        comments.insert(0, FakeElement("You now " + page.box.text + " Like Reply"))
+    return act
+
+
+def test_posting_is_seen_when_the_box_still_reads_full(env):
+    """The fourth live run: the comment landed and the box still read 154 characters."""
+    comments = [FakeElement("Someone 2h ago An earlier comment")]
+    env.entity_comments = comments
+    env.human = [_posts_but_box_stays_full(comments)]
+    _seed()
+    assert rr.ReviewRun(PROFILE).run() == rs.HEALTHY
+    entry = _log()[-1]
+    assert entry["outcome"] == rr.POSTED_AS_IS and entry["thread_match"] == "full"
+    assert entry["said_posted"] is False and entry["box_emptied"] is False
+    assert entry["final_text"] == DRAFT and _rec()["status"] == post_store.COMMENTED
+    assert env.box.text == ""                     # cleared, so leaving raises no prompt
+    assert env.submit.clicks == 0
+
+
+def test_an_edit_is_seen_when_the_box_still_reads_full(env):
+    comments = [FakeElement("Someone 2h ago An earlier comment")]
+    env.entity_comments = comments
+    edited = DRAFT + "\nGROK"
+    env.human = [FakePage.edits_to(edited), _posts_but_box_stays_full(comments)]
+    _seed()
+    rr.ReviewRun(PROFILE).run()
+    entry = _log()[-1]
+    assert entry["outcome"] == rr.POSTED_EDITED and entry["final_text"] == edited
+
+
+def test_box_text_with_no_posted_comment_keeps_waiting(env):
+    """Reading and editing must never count: the text is only in the box."""
+    control = rr.ReviewControl()
+    env.entity_comments = [FakeElement("Someone 2h ago An earlier comment")]
+    env.human = [lambda page: None, FakePage.edits_to(DRAFT + " more words"), lambda page: None,
+                 lambda page: control.request_stop()]
+    _seed()
+    rr.ReviewRun(PROFILE, control=control).run()
+    assert _log()[-1]["outcome"] == rr.UNKNOWN
+
+
+def test_a_stranger_posting_while_they_read_is_not_their_click(env):
+    control = rr.ReviewControl()
+    comments = [FakeElement("Someone 2h ago An earlier comment")]
+    env.entity_comments = comments
+    env.human = [lambda page: comments.insert(0, FakeElement("A stranger now Nice post")),
+                 lambda page: None, lambda page: control.request_stop()]
+    _seed()
+    rr.ReviewRun(PROFILE, control=control).run()
+    assert _log()[-1]["outcome"] == rr.UNKNOWN
+
+
+def test_their_first_comment_on_a_post_with_no_comments(env):
+    comments = []
+    env.entity_comments = comments
+    env.thread.text = ""
+    env.human = [_posts_but_box_stays_full(comments)]
+    _seed()
+    rr.ReviewRun(PROFILE).run()
+    assert _log()[-1]["outcome"] == rr.POSTED_AS_IS
+
+
+def test_the_log_says_when_their_word_ended_the_wait(env):
+    control = rr.ReviewControl()
+    def posted_then_said(page):
+        page.thread.text += " You now " + page.box.text
+        control.say_posted()
+    env.human = [posted_then_said]
+    _seed()
+    assert rr.ReviewRun(PROFILE, control=control).run() == rs.DEGRADED
+    entry = _log()[-1]
+    assert entry["outcome"] == rr.POSTED_ON_THEIR_WORD
+    assert entry["said_posted"] is True and entry["box_emptied"] is False
+
+
+def test_a_box_that_empties_is_still_recorded_as_emptied(env):
+    env.human = [FakePage.clicks_comment]
+    _seed()
+    rr.ReviewRun(PROFILE).run()
+    entry = _log()[-1]
+    assert entry["said_posted"] is False and entry["box_emptied"] is True
 
 
 # Long, with line breaks and every kind of quote: good input must survive untouched.

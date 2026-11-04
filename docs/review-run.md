@@ -41,8 +41,8 @@ to the Trash view, where it can be restored.
 
 **I posted it** moves on when the run has not noticed your click. It records that you
 said so and marks the post as commented, so it is not offered again. It clicks
-nothing. It still looks for your text on the page, and logs `posted_on_their_word`
-with no final text if it cannot see it.
+nothing. It always logs `posted_on_their_word` and the run ends DEGRADED, because the
+run needed telling. `final_text` is filled only if your text could be read back.
 
 **Stop** ends the run. If the current post has no decision yet, you may have clicked
 Comment, so it is logged `unknown`, its page is saved, and the draft is held until you
@@ -60,8 +60,10 @@ exit code (0, 2, 1).
 ## How it sees your click
 
 It reads the page about once a second and changes nothing. A comment counts as
-posted when the box is empty or gone and the last text seen in the box is in the
-thread, or anywhere on the page if no comment selector matches. A comment changed
+posted when your text appears in a posted comment, even if the box still reads as
+full, which happens on some pages. It also counts when the box is empty or gone and
+the last text seen in the box is in the thread, or anywhere on the page if no comment
+selector matches. The log's `box_emptied` says whether the box emptied. A comment changed
 after the run last looked at the box still counts, but `final_text` is then the last
 text it saw, so read `page_excerpt` beside it: that is what the page showed. Each post's page is
 saved the moment its box first empties, and `data/<profile>/review_trace/` records
