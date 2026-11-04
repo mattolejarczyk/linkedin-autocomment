@@ -75,9 +75,18 @@ class FakePage:
         self.idle_looks = 0
         self.insert_fails = False
         self.only_on_page = ""
+        self.nav_outcome = None
+        self.post_on_screen = True
+        self.entity_comments = None
         self.scripts = []
 
     def find_elements(self, by, selector):
+        if self.entity_comments is not None:
+            # The page some accounts get: neither older thread hook matches at all.
+            if selector == cpm.LinkedInCommentPoster.POSTED_COMMENT_ENTITY_SELECTOR:
+                return self.entity_comments
+            if selector == cpm.LinkedInCommentPoster.POSTED_COMMENT_CONTAINER_SELECTOR:
+                return []
         if selector == rr.OPENER_SELECTOR:
             return [self.opener]
         if selector == cpm.LinkedInCommentPoster.SUBMIT_BUTTON_XPATH:
@@ -166,7 +175,14 @@ def env(monkeypatch):
             self.last_navigation = {"url": url, "outcome": "ok", "reason": None}
             page.current_url = url
             page.box.text = ""          # a page load starts with an empty box
+            if page.nav_outcome:
+                self.last_navigation = {"url": url, "outcome": page.nav_outcome,
+                                        "reason": "page load timed out"}
+                return False
             return True
+
+        def post_content_present(self):
+            return page.post_on_screen
 
         @staticmethod
         def submit_button_is_enabled(button):
@@ -857,6 +873,65 @@ def test_page_text_catches_a_repeat_when_thread_selectors_miss(env):
     env.only_on_page = " You 1d " + DRAFT
     _seed()
     assert rr.ReviewRun(PROFILE).run() == rs.HEALTHY
+    assert _log()[-1]["outcome"] == rr.ALREADY_COMMENTED
+    assert env.box.keys == []
+
+
+def test_a_page_past_its_load_limit_but_on_screen_carries_on(env):
+    """The first live timeout: the post, box and thread were all there."""
+    env.nav_outcome = cpm.LinkedInCommentPoster.NAV_TIMEOUT
+    env.human = [FakePage.clicks_comment]
+    _seed()
+    assert rr.ReviewRun(PROFILE).run() == rs.HEALTHY
+    assert _log()[-1]["outcome"] == rr.POSTED_AS_IS
+
+
+def test_a_page_past_its_load_limit_with_no_post_is_a_failure_with_evidence(env):
+    env.nav_outcome = cpm.LinkedInCommentPoster.NAV_TIMEOUT
+    env.post_on_screen = False
+    _seed()
+    assert rr.ReviewRun(PROFILE).run() == rs.DEGRADED
+    entry = _log()[-1]
+    assert entry["outcome"] == rr.FAILED and os.path.exists(entry["evidence"])
+    assert _rec()["status"] == post_store.GENERATED
+
+
+def test_a_post_that_is_gone_does_not_count_as_slow(env):
+    env.nav_outcome = cpm.LinkedInCommentPoster.NAV_UNAVAILABLE
+    _seed()
+    rr.ReviewRun(PROFILE).run()
+    assert _log()[-1]["outcome"] == rr.UNAVAILABLE
+
+
+def test_comments_are_read_on_the_page_some_accounts_get(env):
+    """Taken from a live capture: only article.comments-comment-entity matches."""
+    env.entity_comments = [FakeElement("Someone 2h ago An earlier comment")]
+    poster = rr.LinkedInCommentPoster(profile_name=PROFILE)
+    poster.setup_driver()
+    count, texts = poster.comment_thread_snapshot()
+    assert count is None      # lazily loaded, so a count proves nothing
+    assert texts == ["Someone 2h ago An earlier comment"]
+
+
+def test_the_click_is_seen_on_that_page(env):
+    comments = [FakeElement("Someone 2h ago An earlier comment")]
+    env.entity_comments = comments
+
+    def clicks(page):
+        comments.insert(0, FakeElement("You now " + page.box.text))
+        page.box.text = ""
+
+    env.human = [clicks]
+    _seed()
+    assert rr.ReviewRun(PROFILE).run() == rs.HEALTHY
+    entry = _log()[-1]
+    assert entry["outcome"] == rr.POSTED_AS_IS and entry["thread_match"] == "full"
+
+
+def test_duplicate_check_works_on_that_page(env):
+    env.entity_comments = [FakeElement("You 1d " + DRAFT)]
+    _seed()
+    rr.ReviewRun(PROFILE).run()
     assert _log()[-1]["outcome"] == rr.ALREADY_COMMENTED
     assert env.box.keys == []
 
