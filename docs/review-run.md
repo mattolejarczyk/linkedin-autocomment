@@ -85,6 +85,34 @@ already be on LinkedIn.
 
 The log never changes a persona or voice setting.
 
+## Reviewing from a list, with no browser
+
+For a screen that shows every ready post with its draft. You read the post in your own
+browser, paste the comment and submit it yourself, then record what happened:
+
+```
+python -m linkedin_automation.review_list --profile <name> --list
+python -m linkedin_automation.review_list --profile <name> --posted KEY [--final-text-stdin]
+python -m linkedin_automation.review_list --profile <name> --skip KEY --reason CODE [--note TEXT]
+```
+
+`--list` prints one JSON object, with `drafts` and `skip_reasons`. Exit 0 is done, exit 1
+is refused with a one-line reason on stderr, and anything else failed. It opens no browser
+and never posts.
+
+`--posted` records your word, as `posted_by_hand`, and nothing is read back from LinkedIn.
+It does not make a verdict DEGRADED, because this is the normal case on this route.
+`final_text` is empty unless you supply it, and `final_vs_draft` then says `as_is` or
+`edited` against the original draft, ignoring only whitespace. If you change the comment
+only in LinkedIn's box, this cannot see that, so the log does not claim what went out.
+
+Writes are refused while a morning scan or review run is active, because a run saves the
+store it read at its start and would undo a change made underneath it. A dashboard Scrape
+or Generate takes the same lock. Try again when it finishes. Listing always works. Other
+dashboard actions, such as Remove on a card, do not take the lock. If one overwrites a
+Posted record in the same instant, the posted ledger still keeps it from being offered
+again; a lost Skip would just show that draft again.
+
 ## Morning scan
 
 ```

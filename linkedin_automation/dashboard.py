@@ -106,8 +106,15 @@ def can_start_scheduling_task(profile):
                    for j in active.values())
 
 
-def run_job(job_id, func, *args, profile=None, task_type="api", category="", **kwargs):
-    """Run a function in a background thread and track its progress."""
+def run_job(job_id, func, *args, profile=None, task_type="api", category="",
+            takes_profile_lock=False, **kwargs):
+    """Run a function in a background thread and track its progress.
+
+    ``takes_profile_lock`` holds the profile's cross-process lock for the whole job, so
+    review_list refuses with its busy message instead of writing the post store at the
+    same moment, and the job fails with a clear reason if a morning scan or review run
+    already has it.
+    """
     jobs[job_id] = {
         "status": "running",
         "progress": "",
@@ -125,7 +132,17 @@ def run_job(job_id, func, *args, profile=None, task_type="api", category="", **k
         # Record result/error and logs BEFORE flipping status, so a poller that
         # observes a terminal status always sees the accompanying data.
         try:
-            result = func(job_id, *args, **kwargs)
+            if takes_profile_lock:
+                lock = browser_lock.ProfileBrowserLock(profile, owner=category or "dashboard job")
+                if not lock.acquire():
+                    holder = browser_lock.holder(profile).get("owner", "another process")
+                    raise RuntimeError(f"{holder} is using this profile. Try again when it finishes.")
+                try:
+                    result = func(job_id, *args, **kwargs)
+                finally:
+                    lock.release()
+            else:
+                result = func(job_id, *args, **kwargs)
             jobs[job_id]["result"] = result
             jobs[job_id]["status"] = "completed"
         except pm.LoginRequiredError as e:
@@ -666,7 +683,8 @@ def scrape_posts(profile_name):
     if not can_start_browser_task(profile_name):
         return jsonify({"error": f"A browser task is already running for {profile_name}. Wait for it to finish."}), 409
     run_job(job_id, _scrape_job, profile_name, max_posts, min_quality,
-            profile=profile_name, task_type="browser", category="scrape")
+            profile=profile_name, task_type="browser", category="scrape",
+            takes_profile_lock=True)
     return jsonify({"job_id": job_id})
 
 
@@ -949,7 +967,8 @@ def generate_comments(profile_name):
             "job log above for the reason it gave.")
     
     run_job(job_id, do_generate, profile_name, input_file, model, limit,
-            profile=profile_name, task_type="api", category="generate_comments")
+            profile=profile_name, task_type="api", category="generate_comments",
+            takes_profile_lock=True)
     return jsonify({"job_id": job_id})
 
 
@@ -2398,7 +2417,8 @@ def _sched_submit_scrape_job(profile_name, max_posts, min_quality):
         return None
     job_id = f"sched_scrape_{profile_name}_{int(time.time())}"
     run_job(job_id, _scrape_job, profile_name, max_posts, min_quality,
-            profile=profile_name, task_type="browser", category="scheduled_scrape")
+            profile=profile_name, task_type="browser", category="scheduled_scrape",
+            takes_profile_lock=True)
     return job_id
 
 
