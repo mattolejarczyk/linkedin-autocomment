@@ -169,6 +169,16 @@ def _run_locked(profile_name, allow_production, runner, now):
     scan = post_store._read_json(scan_file) or {}
     seen = scan.get("total_scanned")
     qualified = scan.get("quality_found")
+    # A post the scan wanted but could not get a link for cannot be drafted, and it
+    # goes to the Trash. The run still has drafts, so this would otherwise be silent.
+    lost = sum(1 for p in scan.get("all_posts") or []
+               if p.get("should_engage") and not p.get("url"))
+    lost_reasons = [f"qualified_posts_with_no_link_{lost}"] if lost else []
+    if lost:
+        logger.warning("%d qualifying post(s) lost: no link could be copied; evidence: "
+                       "data/<profile>/failures and %s", lost, log_path)
+    lost_evidence = log_path if lost else None
+    clean_verdict = rs.DEGRADED if lost else rs.HEALTHY
     if not seen:
         logger.warning("The feed showed no posts; evidence: %s", log_path)
         return finish(rs.DEGRADED, ["feed_showed_no_posts"], evidence=log_path,
@@ -177,8 +187,9 @@ def _run_locked(profile_name, allow_production, runner, now):
     store = post_store.load_synced_store(profile_name)
     records = _draftable(store, max_age, now or datetime.now())[:wanted]
     if not records:
-        return finish(rs.HEALTHY, ["nothing_new_to_draft"], evidence=None,
-                      posts_seen=seen, qualified=qualified, new_drafts=0, store=store)
+        return finish(clean_verdict, lost_reasons + ["nothing_new_to_draft"],
+                      evidence=lost_evidence, posts_seen=seen, qualified=qualified,
+                      new_drafts=0, store=store, qualified_lost=lost)
 
     input_path, _ = post_store.write_generator_input(profile_name, records)
     generator = [sys.executable, "-m", "linkedin_automation.comment_generator",
@@ -191,10 +202,11 @@ def _run_locked(profile_name, allow_production, runner, now):
     if code != pm.EXIT_OK:
         reason = "drafting_timed_out" if code is None else f"comment_generator_exit_{code}"
         logger.warning("Drafting DEGRADED (%s); evidence: %s", reason, log_path)
-        return finish(rs.DEGRADED, [reason], evidence=log_path, posts_seen=seen,
-                      qualified=qualified, new_drafts=new_drafts, store=store)
-    return finish(rs.HEALTHY, [], posts_seen=seen, qualified=qualified,
-                  new_drafts=new_drafts, store=store)
+        return finish(rs.DEGRADED, lost_reasons + [reason], evidence=log_path, posts_seen=seen,
+                      qualified=qualified, new_drafts=new_drafts, store=store,
+                      qualified_lost=lost)
+    return finish(clean_verdict, lost_reasons, evidence=lost_evidence, posts_seen=seen,
+                  qualified=qualified, new_drafts=new_drafts, store=store, qualified_lost=lost)
 
 
 def main(argv=None) -> int:

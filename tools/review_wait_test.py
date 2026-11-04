@@ -130,6 +130,23 @@ def main(argv=None) -> int:
             failures.append(f"missed the click with no thread selector: {result}")
         driver.get(url)
 
+        # As on the fourth live run: the comment lands and the box still reads full.
+        driver.find_element("id", "box").send_keys(DRAFT)
+        reader = rr.PageReader(poster, url)
+        reader.box_text()
+        driver.execute_script(
+            "const a = document.createElement('article');"
+            "a.className = 'comments-comment-entity';"
+            "a.textContent = 'You now ' + document.getElementById('box').innerText;"
+            "window.postLater = () => document.body.appendChild(a);"
+            "setTimeout(window.postLater, 3000);")
+        result = rr.wait_for_human(reader, rr.ReviewControl(), DRAFT,
+                                   poll_seconds=0.75, confirm_seconds=20)
+        print(f"box stays full: {result}")
+        if result.get("outcome") != "posted" or result.get("box_emptied") is not False:
+            failures.append(f"missed the click with the box still full: {result}")
+        driver.get(url)
+
         # Their own version goes in whole. A line break must stay text and post nothing.
         box = driver.find_element("id", "box")
         wording = 'Their "own" version, it\'s long.\n\nSecond paragraph here. ' + "More. " * 100

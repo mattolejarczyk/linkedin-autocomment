@@ -42,7 +42,8 @@ class Runner:
     """Stands in for the two child processes."""
 
     def __init__(self, finder_code=0, generator_code=0, scanned=5, qualified=2,
-                 writes_file=True, posts=(1, 2)):
+                 writes_file=True, posts=(1, 2), all_posts=()):
+        self.all_posts = list(all_posts)
         self.calls = []
         self.finder_code = finder_code
         self.generator_code = generator_code
@@ -66,8 +67,8 @@ class Runner:
             path = os.path.join(pm.get_timeline_dir(PROFILE),
                                 f"ai_posts_{datetime.now():%Y%m%d_%H%M%S}.json")
             with open(path, "w", encoding="utf-8") as f:
-                json.dump({"total_scanned": self.scanned,
-                           "quality_found": self.qualified}, f)
+                json.dump({"total_scanned": self.scanned, "quality_found": self.qualified,
+                           "all_posts": self.all_posts}, f)
         return self.finder_code
 
     def _generator(self, args):
@@ -92,6 +93,25 @@ def test_healthy_scan_tops_the_queue_up(profile):
     assert status["posts_seen"] == 5 and status["qualified"] == 2
     assert status["scan_started_at"] and status["scan_finished_at"]
     assert rs.read_status(PROFILE)["ready"] == 2
+
+
+def test_a_qualifying_post_lost_for_want_of_a_link_is_not_healthy(profile):
+    """The first real scan read HEALTHY having binned its best post."""
+    runner = Runner(all_posts=[{"should_engage": True, "url": None},
+                               {"should_engage": True, "url": URL.format(1)},
+                               {"should_engage": False, "url": None}])
+    status = ms.run_scan(PROFILE, runner=runner)
+    assert status["verdict"] == rs.DEGRADED
+    assert status["reasons"] == ["qualified_posts_with_no_link_1"]
+    assert status["qualified_lost"] == 1 and status["new_drafts"] == 2
+    assert status["evidence"] and os.path.exists(status["evidence"])
+
+
+def test_posts_skipped_on_purpose_with_no_link_stay_healthy(profile):
+    runner = Runner(all_posts=[{"should_engage": False, "url": None},
+                               {"should_engage": True, "url": URL.format(1)}])
+    status = ms.run_scan(PROFILE, runner=runner)
+    assert status["verdict"] == rs.HEALTHY and status["qualified_lost"] == 0
 
 
 def test_full_queue_means_no_scan_at_all(profile):

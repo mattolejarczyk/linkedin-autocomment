@@ -183,9 +183,11 @@ class ClickWatcher:
     """Decides from what the page shows whether the human posted the comment.
 
     There is no click event to read without injecting code into LinkedIn's page,
-    so this watches for the result. Posted means the box is empty or gone AND the
-    last text seen in it is now in the thread. An empty box alone proves nothing:
-    the human may be retyping.
+    so this watches for the result. Posted means the text has appeared in a posted
+    comment, whatever the box shows: on a live page the box still read as full after
+    the comment posted. It also means the box is empty or gone AND the last text seen
+    in it is now in the thread or on the page. An empty box alone proves nothing: the
+    human may be retyping.
 
     The thread baseline keeps moving while the box holds text, because "2m ago"
     labels and other people's comments change the thread with no click at all.
@@ -198,6 +200,7 @@ class ClickWatcher:
         self.baseline = None
         self.emptied_at = None
         self.excerpt = None
+        self.items_before = None
 
     def found_in_page(self, thread, page=None):
         """Is the last text in the thread, or failing that anywhere on the page?
@@ -232,16 +235,40 @@ class ClickWatcher:
         at = max(text.index(found) - back, 0)
         self.excerpt = text[at:at + len(wanted) + EXCERPT_EXTRA_CHARS]
 
-    def observe(self, box_text, thread, page=None):
+    def _found_in_a_comment(self, box_text, items):
+        """Has the box's text appeared in a posted comment since the box was filled?
+
+        ``items`` holds only posted comments, never the comment box, so its text
+        cannot be the box's own. The first look only records what was already there.
+        """
+        if self.items_before is None:
+            self.items_before = items or ""
+            return None
+        wanted = normalize(box_text)
+        start = wanted[:MATCH_PREFIX_CHARS]
+        if not items or start not in items:
+            self.items_before = items or self.items_before
+            return None
+        if start in self.items_before:
+            return None
+        self._keep_excerpt(items, start, wanted)
+        return "full" if wanted in items else "prefix"
+
+    def observe(self, box_text, thread, page=None, items=None):
         """Feed one look at the page. Returns a result dict, or None to keep waiting.
 
         ``box_text`` is the box's text, "" if empty, None if it is gone.
         ``thread`` is the normalized thread text, None if it cannot be read.
         ``page`` is the normalized whole page text, read only once the box is empty.
+        ``items`` is the normalized text of posted comments only, None if unreadable.
         """
         if box_text and box_text.strip():
             self.last_text = box_text
             self.emptied_at = None
+            match = self._found_in_a_comment(box_text, items)
+            if match:
+                return {"posted": True, "final_text": box_text, "match": match,
+                        "excerpt": self.excerpt}
             # Not if their text has appeared: LinkedIn may leave it in the box after
             # posting, and "I posted it" still has to be able to find it.
             if thread is not None and (
@@ -335,6 +362,19 @@ class PageReader:
         _, texts = self.poster.comment_thread_snapshot()
         return normalize(" ".join(texts)) if texts else None
 
+    def comment_items(self):
+        """The text of posted comments only. Unlike thread(), this never includes the
+        comment box, because it reads per-comment elements and not the list around them."""
+        poster = self.poster
+        for selector in (poster.POSTED_COMMENT_SELECTOR, poster.POSTED_COMMENT_ENTITY_SELECTOR):
+            try:
+                elements = poster.driver.find_elements(By.CSS_SELECTOR, selector)
+                if elements:
+                    return normalize(" ".join(element.text or "" for element in elements))
+            except Exception:
+                continue
+        return None
+
     def page_text(self):
         """All the page's visible text. Needs no comment selector, so it still works
         when LinkedIn serves markup those selectors do not match."""
@@ -388,11 +428,14 @@ def wait_for_human(reader, control, draft, poll_seconds=0.75, confirm_seconds=20
         thread = reader.thread()
         empty = not (box and box.strip())
         page = reader.page_text() if empty else None
+        items = reader.comment_items()
         seen = (len(box) if box is not None else None,
-                len(thread) if thread is not None else None, empty)
+                len(thread) if thread is not None else None, empty,
+                len(items) if items is not None else None)
         if trace and seen != last_seen:
             trace({"box_chars": seen[0], "box_end": (box or "")[-60:],
-                   "thread_chars": seen[1], "page_chars": len(page) if page else None})
+                   "thread_chars": seen[1], "comment_chars": seen[3],
+                   "page_chars": len(page) if page else None})
             last_seen = seen
 
         if empty and not captured:
@@ -400,10 +443,11 @@ def wait_for_human(reader, control, draft, poll_seconds=0.75, confirm_seconds=20
             if on_box_emptied:
                 on_box_emptied()
 
-        result = watcher.observe(box, thread, page)
+        result = watcher.observe(box, thread, page, items)
         if result is not None and result["posted"]:
             return {"outcome": "posted", "final_text": result["final_text"],
-                    "match": result["match"], "excerpt": result["excerpt"], "reason": None}
+                    "match": result["match"], "excerpt": result["excerpt"], "reason": None,
+                    "box_emptied": empty}
 
         if control.take_said_posted():
             return _read_back_after_their_word(reader, watcher, poll_seconds, confirm_seconds)
@@ -438,11 +482,11 @@ def _read_back_after_their_word(reader, watcher, poll_seconds, confirm_seconds):
         if match:
             return {"outcome": "said_posted", "final_text": watcher.last_text, "match": match,
                     "excerpt": watcher.excerpt, "reason": None,
-                    "last_box_text": watcher.last_text}
+                    "last_box_text": watcher.last_text, "box_emptied": empty}
         if watcher.clock() >= deadline:
             return {"outcome": "said_posted", "final_text": None, "match": None,
                     "reason": "said_posted_read_back_found_nothing",
-                    "last_box_text": watcher.last_text}
+                    "last_box_text": watcher.last_text, "box_emptied": empty}
         time.sleep(poll_seconds)
 
 
@@ -467,7 +511,8 @@ class ReviewRun:
 
     def log_outcome(self, rec, outcome, loaded_text=None, final_text=None, reason=None,
                     match=None, evidence=None, last_box_text=None, skip_reason=None,
-                    skip_note=None, feedback=None, excerpt=None):
+                    skip_note=None, feedback=None, excerpt=None, said_posted=False,
+                    box_emptied=None):
         """One line per post: the draft, what was approved, and what was posted."""
         self.tally[outcome] = self.tally.get(outcome, 0) + 1
         entry = {
@@ -491,6 +536,8 @@ class ReviewRun:
             "feedback_used_in_box": (feedback or {}).get("used", False),
             "thread_match": match,
             "page_excerpt": excerpt,
+            "said_posted": said_posted,
+            "box_emptied": box_emptied,
             "evidence": evidence,
         }
         with open(self._log_path(), "a", encoding="utf-8") as f:
@@ -632,15 +679,23 @@ class ReviewRun:
         url = rec["url"]
         outcome = result["outcome"]
         feedback = self.control.take_feedback()
-        if outcome == "said_posted" and result.get("final_text") is None:
-            # Their word is enough to never offer it again. The page did not confirm
-            # it, so there is no final text to record, and that is logged as such.
+        if outcome == "said_posted":
+            # Its own outcome whatever the read-back found: the run did not notice the
+            # click, so this must never read like a detection that worked. Their word
+            # is enough to never offer it again. final_text is only set if the page
+            # confirmed it, with the page saved either way so the miss can be read.
+            final = result.get("final_text")
+            if final:
+                self.store.set_final_comment(rec["key"], final)
             self._mark_commented(url)
             self.log_outcome(logged, POSTED_ON_THEIR_WORD, loaded_text=loaded_text,
-                             reason=result.get("reason"),
-                             evidence=self._evidence("said_posted_not_seen"),
-                             last_box_text=result.get("last_box_text"), feedback=feedback)
-        elif outcome in ("posted", "said_posted"):
+                             final_text=final, reason=result.get("reason"),
+                             match=result.get("match"), excerpt=result.get("excerpt"),
+                             evidence=self._evidence("said_posted_not_detected"),
+                             last_box_text=result.get("last_box_text"), feedback=feedback,
+                             said_posted=True, box_emptied=result.get("box_emptied"))
+            self._clear_box_for_leaving()
+        elif outcome == "posted":
             final = result["final_text"]
             edited = normalize(final) != normalize(loaded_text)
             self.store.set_final_comment(rec["key"], final)
@@ -649,7 +704,11 @@ class ReviewRun:
                              loaded_text=loaded_text, final_text=final,
                              match=result.get("match"), feedback=feedback,
                              evidence=result.get("emptied_evidence"),
-                             excerpt=result.get("excerpt"))
+                             excerpt=result.get("excerpt"),
+                             box_emptied=result.get("box_emptied"))
+            # LinkedIn can leave the text in the box after posting. Leaving it there
+            # risks a "Leave site?" prompt on the next post.
+            self._clear_box_for_leaving()
         elif outcome == SKIPPED:
             self.log_outcome(logged, SKIPPED, loaded_text=loaded_text,
                              reason=result.get("reason"),

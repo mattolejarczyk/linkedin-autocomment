@@ -58,7 +58,7 @@ def write_status(profile_name, store=None, **fields) -> dict:
     status.setdefault("verdict", DEGRADED)
     status.setdefault("reasons", ["no_scan_yet"])
     for key in ("scan_started_at", "scan_finished_at", "scan_skipped",
-                "posts_seen", "qualified", "new_drafts", "evidence"):
+                "posts_seen", "qualified", "qualified_lost", "new_drafts", "evidence"):
         status.setdefault(key, None)
 
     ready = ready_drafts(profile_name, store=store)
