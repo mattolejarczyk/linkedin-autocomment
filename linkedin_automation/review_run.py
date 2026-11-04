@@ -11,7 +11,12 @@ file's source as well as by running it against a recording driver. The poster it
 borrows from has ``human_click_only`` forced on, so its submit methods raise.
 
 While waiting, it only reads the page: no mouse, no scrolling, no human_behavior
-calls, because the human is using that window.
+calls, because the human is using that window. The one exception is the human
+pressing "Use this" in the control window, which puts their own wording in the box.
+Even then the human clicks Comment.
+
+Feedback typed in the control window goes in the log, word for word. It never
+changes a persona or voice setting.
 """
 
 import argparse
@@ -39,6 +44,7 @@ LOG_FILE = "review_log.jsonl"
 
 POSTED_AS_IS = "posted_as_is"
 POSTED_EDITED = "posted_edited"
+POSTED_ON_THEIR_WORD = "posted_on_their_word"
 SKIPPED = "skipped"
 UNKNOWN = "unknown"
 FAILED = "failed"
@@ -52,6 +58,13 @@ OPENER_SELECTOR = "button[aria-label='%s']" % LinkedInCommentPoster.SUBMIT_BUTTO
 #: How much of a comment must match in the thread. LinkedIn can collapse a long
 #: comment behind "see more", so the whole text is not always on the page.
 MATCH_PREFIX_CHARS = 80
+
+#: A run of this many characters of their text counts as finding it, for a comment
+#: changed after the last look at the box. Long enough not to be chance wording.
+MATCH_PIECE_CHARS = 40
+
+#: How much of the page to keep around a match, so the log shows what really posted.
+EXCERPT_EXTRA_CHARS = 200
 
 
 #: Why a post was skipped: (code, what the dropdown shows, stays in the queue).
@@ -67,6 +80,12 @@ SKIP_REASONS = (
     ("other", "Other (type your reason)", False),
 )
 OTHER_REASON = "other"
+
+
+#: What the human's typed words are.
+FEEDBACK_MY_VERSION = "my_version"
+FEEDBACK_DIRECTION = "direction"
+FEEDBACK_KINDS = (FEEDBACK_DIRECTION, FEEDBACK_MY_VERSION)
 
 
 def skip_reason_problem(code, note=None):
@@ -95,6 +114,9 @@ class ReviewControl:
 
     def __init__(self):
         self._skip = None
+        self._use_text = None
+        self._feedback = None
+        self._said_posted = threading.Event()
         self._stop = threading.Event()
         self.done = threading.Event()
         self.position = 0
@@ -107,10 +129,45 @@ class ReviewControl:
         problem = skip_reason_problem(reason, note)
         if problem:
             raise ValueError(problem)
-        self._skip = {"code": reason, "note": (note or "").strip() or None}
+        self._skip = {"code": reason, "note": note if (note or "").strip() else None}
+
+    def give_feedback(self, kind, text, reason=None):
+        """Keep what the human typed for this post, exactly as typed."""
+        if kind not in FEEDBACK_KINDS:
+            raise ValueError(f"Unknown feedback type: {kind}")
+        if (text or "").strip():
+            self._feedback = {"kind": kind, "text": text, "reason": reason, "used": False}
+
+    def take_feedback(self):
+        """The feedback for this post, once. None if there is none."""
+        feedback, self._feedback = self._feedback, None
+        return feedback
+
+    def request_use_text(self, text):
+        """Ask for this text to replace what is in the comment box."""
+        if not (text or "").strip():
+            raise ValueError("Type your version first.")
+        self._use_text = text
+
+    def take_use_text(self):
+        text, self._use_text = self._use_text, None
+        return text
+
+    def mark_feedback_used(self):
+        if self._feedback:
+            self._feedback["used"] = True
 
     def request_stop(self):
         self._stop.set()
+
+    def say_posted(self):
+        """The human says they posted this one. Records their word; submits nothing."""
+        self._said_posted.set()
+
+    def take_said_posted(self) -> bool:
+        said = self._said_posted.is_set()
+        self._said_posted.clear()
+        return said
 
     def take_skip(self):
         """The reason given, once per Skip. None if no skip is waiting."""
@@ -140,31 +197,66 @@ class ClickWatcher:
         self.clock = clock
         self.baseline = None
         self.emptied_at = None
+        self.excerpt = None
 
-    def observe(self, box_text, thread):
+    def found_in_page(self, thread, page=None):
+        """Is the last text in the thread, or failing that anywhere on the page?
+
+        ``page`` is the whole page's text, which needs no comment selector at all.
+        It is only meaningful once the box is empty, or it would find the box itself.
+        Returns "full", "prefix", "part", or None. "part" is the comment changed after
+        the last look, so ``last_text`` may not be exactly what posted. ``excerpt`` then
+        holds what the page shows there, which is the better record.
+        """
+        wanted = normalize(self.last_text)
+        known = self.baseline or ""
+        if wanted[:MATCH_PREFIX_CHARS] in known:
+            return None
+        for text in (thread, page):
+            if not text:
+                continue
+            if wanted in text:
+                self._keep_excerpt(text, wanted, wanted)
+                return "full"
+            if wanted[:MATCH_PREFIX_CHARS] in text:
+                self._keep_excerpt(text, wanted[:MATCH_PREFIX_CHARS], wanted)
+                return "prefix"
+            for start in range(0, max(len(wanted) - MATCH_PIECE_CHARS, 0) + 1, 10):
+                piece = wanted[start:start + MATCH_PIECE_CHARS]
+                if len(piece) == MATCH_PIECE_CHARS and piece in text and piece not in known:
+                    self._keep_excerpt(text, piece, wanted, back=start)
+                    return "part"
+        return None
+
+    def _keep_excerpt(self, text, found, wanted, back=0):
+        at = max(text.index(found) - back, 0)
+        self.excerpt = text[at:at + len(wanted) + EXCERPT_EXTRA_CHARS]
+
+    def observe(self, box_text, thread, page=None):
         """Feed one look at the page. Returns a result dict, or None to keep waiting.
 
         ``box_text`` is the box's text, "" if empty, None if it is gone.
         ``thread`` is the normalized thread text, None if it cannot be read.
+        ``page`` is the normalized whole page text, read only once the box is empty.
         """
         if box_text and box_text.strip():
             self.last_text = box_text
             self.emptied_at = None
-            if thread is not None:
+            # Not if their text has appeared: LinkedIn may leave it in the box after
+            # posting, and "I posted it" still has to be able to find it.
+            if thread is not None and (
+                    self.baseline is None
+                    or normalize(box_text)[:MATCH_PREFIX_CHARS] not in thread):
                 self.baseline = thread
             return None
 
         if self.emptied_at is None:
             self.emptied_at = self.clock()
 
-        if thread:
-            wanted = normalize(self.last_text)
-            already_there = self.baseline and wanted[:MATCH_PREFIX_CHARS] in self.baseline
-            if not already_there:
-                if wanted in thread:
-                    return {"posted": True, "final_text": self.last_text, "match": "full"}
-                if wanted[:MATCH_PREFIX_CHARS] in thread:
-                    return {"posted": True, "final_text": self.last_text, "match": "prefix"}
+        match = self.found_in_page(thread, page)
+        if match:
+            return {"posted": True, "final_text": self.last_text, "match": match,
+                    "excerpt": self.excerpt}
 
         if self.clock() - self.emptied_at < self.confirm_seconds:
             return None
@@ -243,41 +335,113 @@ class PageReader:
         _, texts = self.poster.comment_thread_snapshot()
         return normalize(" ".join(texts)) if texts else None
 
+    def page_text(self):
+        """All the page's visible text. Needs no comment selector, so it still works
+        when LinkedIn serves markup those selectors do not match."""
+        try:
+            return normalize(self.poster.driver.execute_script(
+                "return document.body.innerText"))
+        except Exception:
+            return None
+
     def left_the_post(self):
         return self.poster.navigated_away_from(self.url)
 
 
-def wait_for_human(reader, control, draft, poll_seconds=0.75, confirm_seconds=20.0):
-    """Wait, reading only, until the human posts, skips or stops. No time limit.
+def wait_for_human(reader, control, draft, poll_seconds=0.75, confirm_seconds=20.0,
+                   put_in_box=None, on_box_emptied=None, trace=None):
+    """Wait until the human posts, skips, stops or says they posted. No time limit.
+
+    It only reads the page, unless the human asks for their own wording to go in
+    the box, which ``put_in_box`` does.
+
+    The page is read BEFORE acting on any button, so a comment already posted is
+    seen as posted, not skipped. A Stop with no decision yet is never logged as a
+    skip: the human may have clicked Comment, so the outcome is unknown.
+
+    ``on_box_emptied`` is called once per post, the first time the box empties, so
+    the page is on file at the moment that matters. ``trace`` is called with what
+    was seen each time it changes.
 
     Returns ``{"outcome": ..., "final_text": ..., "reason": ..., "match": ...}``.
     """
     watcher = ClickWatcher(draft, confirm_seconds=confirm_seconds)
+    told_cannot_see = False
+    captured = False
+    last_seen = None
+
+    def undecided(reason):
+        return {"outcome": UNKNOWN, "final_text": None, "reason": reason,
+                "last_box_text": watcher.last_text}
+
     while True:
         try:
             reader.check_alive()
         except BrowserClosed:
-            return {"outcome": UNKNOWN, "final_text": None, "reason": "browser_closed",
-                    "last_box_text": watcher.last_text}
+            return undecided("browser_closed")
+
+        text = control.take_use_text()
+        if text and put_in_box and put_in_box(text) is False:
+            told_cannot_see = True      # keep the window's more specific message
+
+        box = reader.box_text()
+        thread = reader.thread()
+        empty = not (box and box.strip())
+        page = reader.page_text() if empty else None
+        seen = (len(box) if box is not None else None,
+                len(thread) if thread is not None else None, empty)
+        if trace and seen != last_seen:
+            trace({"box_chars": seen[0], "box_end": (box or "")[-60:],
+                   "thread_chars": seen[1], "page_chars": len(page) if page else None})
+            last_seen = seen
+
+        if empty and not captured:
+            captured = True
+            if on_box_emptied:
+                on_box_emptied()
+
+        result = watcher.observe(box, thread, page)
+        if result is not None and result["posted"]:
+            return {"outcome": "posted", "final_text": result["final_text"],
+                    "match": result["match"], "excerpt": result["excerpt"], "reason": None}
+
+        if control.take_said_posted():
+            return _read_back_after_their_word(reader, watcher, poll_seconds, confirm_seconds)
         if control.stop_requested:
-            return {"outcome": SKIPPED, "final_text": None, "reason": "stopped",
-                    "last_box_text": watcher.last_text}
+            return undecided("stopped_with_no_decision")
         skip = control.take_skip()
         if skip:
             return {"outcome": SKIPPED, "final_text": None, "reason": "skipped",
                     "skip_reason": skip["code"], "skip_note": skip["note"],
                     "last_box_text": watcher.last_text}
 
-        result = watcher.observe(reader.box_text(), reader.thread())
         if result is not None:
-            if result["posted"]:
-                return {"outcome": "posted", "final_text": result["final_text"],
-                        "match": result["match"], "reason": None}
-            return {"outcome": UNKNOWN, "final_text": None, "reason": result["reason"],
-                    "last_box_text": watcher.last_text}
-
+            return undecided(result["reason"])
         if reader.left_the_post():
-            return {"outcome": UNKNOWN, "final_text": None, "reason": "left_the_post",
+            return undecided("left_the_post")
+
+        if empty and not told_cannot_see and watcher.emptied_at is not None \
+                and watcher.clock() - watcher.emptied_at >= confirm_seconds:
+            told_cannot_see = True
+            control.message = ("The box is empty but I can't see your comment on the page. "
+                               'If you posted it, press "I posted it".')
+        time.sleep(poll_seconds)
+
+
+def _read_back_after_their_word(reader, watcher, poll_seconds, confirm_seconds):
+    """They say it posted. Their word decides; the page only adds the final text."""
+    deadline = watcher.clock() + confirm_seconds
+    while True:
+        box = reader.box_text()
+        empty = not (box and box.strip())
+        match = watcher.found_in_page(reader.thread(), reader.page_text() if empty else None)
+        if match:
+            return {"outcome": "said_posted", "final_text": watcher.last_text, "match": match,
+                    "excerpt": watcher.excerpt, "reason": None,
+                    "last_box_text": watcher.last_text}
+        if watcher.clock() >= deadline:
+            return {"outcome": "said_posted", "final_text": None, "match": None,
+                    "reason": "said_posted_read_back_found_nothing",
                     "last_box_text": watcher.last_text}
         time.sleep(poll_seconds)
 
@@ -303,7 +467,7 @@ class ReviewRun:
 
     def log_outcome(self, rec, outcome, loaded_text=None, final_text=None, reason=None,
                     match=None, evidence=None, last_box_text=None, skip_reason=None,
-                    skip_note=None):
+                    skip_note=None, feedback=None, excerpt=None):
         """One line per post: the draft, what was approved, and what was posted."""
         self.tally[outcome] = self.tally.get(outcome, 0) + 1
         entry = {
@@ -321,7 +485,12 @@ class ReviewRun:
             "reason": reason,
             "skip_reason": skip_reason,
             "skip_note": skip_note,
+            "feedback_type": (feedback or {}).get("kind"),
+            "feedback_text": (feedback or {}).get("text"),
+            "feedback_reason": (feedback or {}).get("reason"),
+            "feedback_used_in_box": (feedback or {}).get("used", False),
             "thread_match": match,
+            "page_excerpt": excerpt,
             "evidence": evidence,
         }
         with open(self._log_path(), "a", encoding="utf-8") as f:
@@ -369,6 +538,10 @@ class ReviewRun:
             return
 
         already, why = poster.already_commented_here(draft)
+        reader = PageReader(poster, url)
+        if not already and normalize(draft)[:MATCH_PREFIX_CHARS] in (reader.page_text() or ""):
+            # The thread selectors can miss, and a repeat comment cannot be undone.
+            already, why = True, "this comment's text is already on the page"
         if already:
             self._mark_commented(url)
             self.log_outcome(logged, ALREADY_COMMENTED, reason=why)
@@ -390,33 +563,88 @@ class ReviewRun:
             return
 
         self.control.message = "Read it, edit if you like, then click Comment yourself."
+        self.control.take_feedback()      # nothing carries over from another post
+        self.control.take_use_text()
+        emptied_evidence = {}
+
+        def on_box_emptied():
+            emptied_evidence["path"] = self._evidence("box_emptied")
+            logger.info("REVIEW box emptied post=%s evidence=%s", url, emptied_evidence["path"])
+
         result = wait_for_human(
-            PageReader(poster, url), self.control, loaded_text,
+            reader, self.control, loaded_text,
             poll_seconds=self.settings["poll_seconds"],
-            confirm_seconds=self.settings["posted_confirm_seconds"])
+            confirm_seconds=self.settings["posted_confirm_seconds"],
+            put_in_box=self._put_in_box, on_box_emptied=on_box_emptied,
+            trace=lambda seen: self._trace(url, seen))
+        result["emptied_evidence"] = emptied_evidence.get("path")
         self._record_result(rec, logged, loaded_text, result)
+
+    def _trace(self, url, seen):
+        """What the run saw as it waited, so a miss can be read afterwards."""
+        path = os.path.join(pm.get_data_dir(self.profile_name, "review_trace"),
+                            f"trace_{self.run_id}.jsonl")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"at": datetime.now().isoformat(), "url": url, **seen},
+                               ensure_ascii=False) + "\n")
+
+    def _put_in_box(self, text) -> bool:
+        """Replace the box's text with the human's own wording. Never submits.
+
+        Inserted whole rather than typed key by key, so a line break in their text
+        is text, not an Enter key press. Says so if it did not land.
+        """
+        poster = self.poster
+        box = poster.await_comment_input(timeout=1.0)
+        landed = False
+        if box is not None:
+            try:
+                poster.clear_comment_box(box)
+                poster.focus_comment_box(box)
+                poster.insert_via_cdp(box, text)
+                landed = normalize(box.text) == normalize(text)
+            except Exception:
+                logger.warning("Could not put the text in the box", exc_info=True)
+        if landed:
+            self.control.mark_feedback_used()
+            self.control.message = "Your version is in the box. Click Comment when you're happy."
+        else:
+            evidence = self._evidence("use_text_did_not_land")
+            logger.warning("Your version did not land in the box; evidence: %s", evidence)
+            self.control.message = "Your version did not go in. Check the box before you click."
+        return landed
 
     def _record_result(self, rec, logged, loaded_text, result):
         url = rec["url"]
         outcome = result["outcome"]
-        if outcome == "posted":
+        feedback = self.control.take_feedback()
+        if outcome == "said_posted" and result.get("final_text") is None:
+            # Their word is enough to never offer it again. The page did not confirm
+            # it, so there is no final text to record, and that is logged as such.
+            self._mark_commented(url)
+            self.log_outcome(logged, POSTED_ON_THEIR_WORD, loaded_text=loaded_text,
+                             reason=result.get("reason"),
+                             evidence=self._evidence("said_posted_not_seen"),
+                             last_box_text=result.get("last_box_text"), feedback=feedback)
+        elif outcome in ("posted", "said_posted"):
             final = result["final_text"]
             edited = normalize(final) != normalize(loaded_text)
             self.store.set_final_comment(rec["key"], final)
             self._mark_commented(url)
             self.log_outcome(logged, POSTED_EDITED if edited else POSTED_AS_IS,
                              loaded_text=loaded_text, final_text=final,
-                             match=result.get("match"))
+                             match=result.get("match"), feedback=feedback,
+                             evidence=result.get("emptied_evidence"),
+                             excerpt=result.get("excerpt"))
         elif outcome == SKIPPED:
             self.log_outcome(logged, SKIPPED, loaded_text=loaded_text,
                              reason=result.get("reason"),
                              skip_reason=result.get("skip_reason"),
                              skip_note=result.get("skip_note"),
-                             last_box_text=result.get("last_box_text"))
+                             last_box_text=result.get("last_box_text"),
+                             feedback=feedback)
             self._clear_box_for_leaving()
-            # A Stop has no reason and stays queued, as does "not now".
-            code = result.get("skip_reason")
-            if code and not skip_keeps_in_queue(code):
+            if not skip_keeps_in_queue(result.get("skip_reason")):
                 self.store.reject(rec["key"], save=True)
         else:
             # Could not tell. It may be on LinkedIn, so it is held back rather
@@ -428,7 +656,8 @@ class ReviewRun:
                 evidence = self._evidence("unknown_outcome")
             self.log_outcome(logged, UNKNOWN, loaded_text=loaded_text,
                              reason=result.get("reason"), evidence=evidence,
-                             last_box_text=result.get("last_box_text"))
+                             last_box_text=result.get("last_box_text"),
+                             feedback=feedback)
 
     def _clear_box_for_leaving(self):
         """Empty the box so leaving the page raises no "Leave site?" prompt."""
@@ -459,7 +688,8 @@ class ReviewRun:
         return recs[:limit]
 
     def verdict(self):
-        if self.tally.get(UNKNOWN) or self.tally.get(FAILED):
+        if (self.tally.get(UNKNOWN) or self.tally.get(FAILED)
+                or self.tally.get(POSTED_ON_THEIR_WORD)):
             return rs.DEGRADED
         return rs.HEALTHY
 

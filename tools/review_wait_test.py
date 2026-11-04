@@ -117,6 +117,33 @@ def main(argv=None) -> int:
         if waited < args.minutes:
             failures.append("the wait ended before the human acted")
 
+        # The same click on a page where no comment selector matches, as may have
+        # happened live: the box empties and the text is only findable on the page.
+        driver.get(url)
+        driver.find_element("id", "box").send_keys(DRAFT)
+        driver.execute_script("document.querySelector('[data-testid]').removeAttribute('data-testid')")
+        reader = _ActsAfter(poster, url, time.time())
+        result = rr.wait_for_human(reader, rr.ReviewControl(), DRAFT,
+                                   poll_seconds=0.75, confirm_seconds=20)
+        print(f"no thread selector: {result}")
+        if result.get("outcome") != "posted" or result.get("final_text") != EDITED:
+            failures.append(f"missed the click with no thread selector: {result}")
+        driver.get(url)
+
+        # Their own version goes in whole. A line break must stay text and post nothing.
+        box = driver.find_element("id", "box")
+        wording = 'Their "own" version, it\'s long.\n\nSecond paragraph here. ' + "More. " * 100
+        before_thread = reader.thread()
+        poster.clear_comment_box(box)
+        poster.focus_comment_box(box)
+        poster.insert_via_cdp(box, wording)
+        print("own version landed:", rr.normalize(box.text) == rr.normalize(wording))
+        if rr.normalize(box.text) != rr.normalize(wording):
+            failures.append(f"own version came out as {box.text!r}")
+        if reader.thread() != before_thread:
+            failures.append("inserting their version posted something")
+        poster.clear_comment_box(box)
+
         # Leaving a page: the run empties the box first, so no prompt should come up.
         box = driver.find_element("id", "box")
         box.send_keys("Text about to be skipped")

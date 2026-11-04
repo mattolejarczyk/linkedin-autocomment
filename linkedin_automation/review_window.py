@@ -4,14 +4,17 @@ A separate window rather than buttons on the page, so nothing is added to
 LinkedIn's page and the dashboard does not need to be running.
 
 Skip asks why. It only takes effect once a reason is chosen from the list, or Other
-is chosen and a reason typed.
+is chosen and a reason typed. The same panel takes the human's own words: a direction
+on what should be different, or their own version of the comment, which "Use this"
+puts in LinkedIn's box for them to read and click Comment.
 """
 
 import gc
 import tkinter as tk
 from tkinter import ttk
 
-from .review_run import OTHER_REASON, SKIP_REASONS, skip_reason_problem
+from .review_run import (FEEDBACK_DIRECTION, FEEDBACK_MY_VERSION, OTHER_REASON,
+                         SKIP_REASONS, skip_reason_problem)
 
 
 class ReviewWindow:
@@ -26,39 +29,46 @@ class ReviewWindow:
         self.position = tk.StringVar(self.root)
         self.message = tk.StringVar(self.root)
         self.reason = tk.StringVar(self.root)
-        self.note = tk.StringVar(self.root)
+        self.kind = tk.StringVar(self.root, value=FEEDBACK_DIRECTION)
         self.problem = tk.StringVar(self.root)
 
         tk.Label(self.root, textvariable=self.position,
                  font=("Segoe UI", 12, "bold")).pack(padx=12, pady=(10, 2))
-        tk.Label(self.root, textvariable=self.message, wraplength=300,
+        tk.Label(self.root, textvariable=self.message, wraplength=340,
                  justify="center").pack(padx=12, pady=(0, 8))
 
         self.buttons = tk.Frame(self.root)
         self.buttons.pack(padx=12, pady=(0, 10))
-        tk.Button(self.buttons, text="Skip this post", width=14,
+        tk.Button(self.buttons, text="Skip or give feedback", width=20,
                   command=self.open_skip_panel).pack(side="left", padx=4)
+        tk.Button(self.buttons, text="I posted it", width=12,
+                  command=control.say_posted).pack(side="left", padx=4)
         tk.Button(self.buttons, text="Stop", width=8,
                   command=control.request_stop).pack(side="left", padx=4)
 
         self.panel = tk.Frame(self.root)
         tk.Label(self.panel, text="Why are you skipping this post?").pack(anchor="w")
         self.dropdown = ttk.Combobox(self.panel, textvariable=self.reason, state="readonly",
-                                     width=46, values=[label for _, label, _ in SKIP_REASONS])
-        self.dropdown.pack(fill="x", pady=(2, 6))
-        self.dropdown.bind("<<ComboboxSelected>>", lambda event: self._show_note())
+                                     width=52, values=[label for _, label, _ in SKIP_REASONS])
+        self.dropdown.pack(fill="x", pady=(2, 8))
 
-        self.note_box = tk.Frame(self.panel)
-        tk.Label(self.note_box, text="Your reason:").pack(anchor="w")
-        tk.Entry(self.note_box, textvariable=self.note).pack(fill="x", pady=(2, 6))
+        tk.Label(self.panel, text="Your words (optional, needed for Other):").pack(anchor="w")
+        self.text = tk.Text(self.panel, width=52, height=7, wrap="word")
+        self.text.pack(fill="x", pady=(2, 4))
+        tk.Radiobutton(self.panel, text="A direction: what should be different",
+                       variable=self.kind, value=FEEDBACK_DIRECTION).pack(anchor="w")
+        tk.Radiobutton(self.panel, text="My own version of the comment",
+                       variable=self.kind, value=FEEDBACK_MY_VERSION).pack(anchor="w")
 
-        self.panel_end = tk.Frame(self.panel)
-        self.panel_end.pack(fill="x")
-        tk.Label(self.panel_end, textvariable=self.problem, fg="#b00020").pack(anchor="w")
-        tk.Button(self.panel_end, text="Skip", width=10,
-                  command=self.confirm_skip).pack(side="left", padx=(0, 4), pady=(4, 0))
-        tk.Button(self.panel_end, text="Cancel", width=10,
-                  command=self.cancel_skip).pack(side="left", pady=(4, 0))
+        tk.Label(self.panel, textvariable=self.problem, fg="#b00020").pack(anchor="w")
+        actions = tk.Frame(self.panel)
+        actions.pack(fill="x", pady=(4, 0))
+        tk.Button(actions, text="Skip", width=8,
+                  command=self.confirm_skip).pack(side="left", padx=(0, 4))
+        tk.Button(actions, text="Use this, don't skip", width=18,
+                  command=self.use_this).pack(side="left", padx=(0, 4))
+        tk.Button(actions, text="Cancel", width=8,
+                  command=self.cancel_skip).pack(side="left")
 
         # Closing the window means stop. The run closes the browser and exits.
         self.root.protocol("WM_DELETE_WINDOW", control.request_stop)
@@ -69,11 +79,13 @@ class ReviewWindow:
                 return code
         return None
 
-    def _show_note(self):
-        if self._code_chosen() == OTHER_REASON:
-            self.note_box.pack(fill="x", before=self.panel_end)
-        else:
-            self.note_box.pack_forget()
+    def words(self):
+        """Exactly what was typed. "end-1c" drops only the newline Tk itself adds."""
+        return self.text.get("1.0", "end-1c")
+
+    def set_words(self, words):
+        self.text.delete("1.0", "end")
+        self.text.insert("1.0", words)
 
     def open_skip_panel(self):
         """Ask why. The post is not skipped until a reason is confirmed."""
@@ -83,18 +95,33 @@ class ReviewWindow:
     def close_skip_panel(self):
         self.panel_open = False
         self.reason.set("")
-        self.note.set("")
+        self.kind.set(FEEDBACK_DIRECTION)
         self.problem.set("")
-        self.note_box.pack_forget()
+        self.set_words("")
         self.panel.pack_forget()
 
     def confirm_skip(self):
         code = self._code_chosen()
-        problem = skip_reason_problem(code, self.note.get())
+        words = self.words()
+        problem = skip_reason_problem(code, words)
         if problem:
             self.problem.set(problem)
             return
-        self.control.request_skip(code, self.note.get() if code == OTHER_REASON else None)
+        self.control.give_feedback(self.kind.get(), words, code)
+        self.control.request_skip(code, words if code == OTHER_REASON else None)
+        self.close_skip_panel()
+
+    def use_this(self):
+        """Put their own version in LinkedIn's box. It does not skip or post."""
+        words = self.words()
+        if self.kind.get() != FEEDBACK_MY_VERSION:
+            self.problem.set('Choose "My own version" to put your words in the box.')
+            return
+        if not words.strip():
+            self.problem.set("Type your version first.")
+            return
+        self.control.give_feedback(FEEDBACK_MY_VERSION, words, self._code_chosen())
+        self.control.request_use_text(words)
         self.close_skip_panel()
 
     def cancel_skip(self):

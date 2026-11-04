@@ -73,6 +73,8 @@ class FakePage:
         self.closed = False
         self.human = []                                 # steps run between looks
         self.idle_looks = 0
+        self.insert_fails = False
+        self.only_on_page = ""
         self.scripts = []
 
     def find_elements(self, by, selector):
@@ -92,7 +94,15 @@ class FakePage:
             return self.submit
         if "execCommand('delete'" in script:
             self.box.text = ""
+        if script == "return document.body.innerText":
+            return "The post text " + self.box.text + " " + self.thread.text + self.only_on_page
         return None
+
+    def execute_cdp_cmd(self, command, params):
+        """Text inserted whole by the browser, not typed key by key."""
+        assert command == "Input.insertText"
+        if not self.insert_fails:
+            self.box.text += params["text"]
 
     def save_screenshot(self, path):
         with open(path, "wb") as f:
@@ -155,6 +165,7 @@ def env(monkeypatch):
         def navigate_to_post(self, url):
             self.last_navigation = {"url": url, "outcome": "ok", "reason": None}
             page.current_url = url
+            page.box.text = ""          # a page load starts with an empty box
             return True
 
         @staticmethod
@@ -436,6 +447,60 @@ def test_a_collapsed_comment_matches_on_its_start():
     assert result["posted"] is True and result["match"] == "prefix"
 
 
+def test_a_keyword_added_on_its_own_line_is_matched():
+    """Real use: adding a keyword to get the free thing. Line break included."""
+    with_keyword = DRAFT + "\nSkills"
+    w, _ = _watcher()
+    w.observe(DRAFT, THREAD)
+    w.observe(with_keyword, THREAD)
+    result = w.observe("", THREAD + " You now " + DRAFT + "\nSkills".replace("\n", " "))
+    assert result["posted"] is True and result["match"] == "full"
+    assert result["final_text"] == with_keyword
+
+
+def test_a_keyword_added_after_the_last_look_still_counts_and_the_excerpt_shows_it():
+    """The box was last seen without it, so last_text is short. The excerpt is not."""
+    w, _ = _watcher()
+    w.observe(DRAFT, THREAD)
+    result = w.observe("", THREAD + " You now " + DRAFT + " Skills Like Reply")
+    assert result["posted"] is True and result["match"] == "full"
+    assert DRAFT + " Skills" in result["excerpt"]
+
+
+def test_an_edit_near_the_start_after_the_last_look_still_counts():
+    """Neither the whole text nor its first 80 characters are on the page now."""
+    w, _ = _watcher()
+    w.observe(DRAFT, THREAD)
+    posted = "Totally changed the opening here, and then " + DRAFT[30:]
+    result = w.observe("", THREAD + " You now " + posted)
+    assert result["posted"] is True and result["match"] == "part"
+    assert posted[:20] not in DRAFT and DRAFT[30:] in result["excerpt"]
+
+
+def test_a_chance_short_overlap_is_not_a_match():
+    w, clock = _watcher(confirm=20)
+    w.observe(DRAFT, THREAD)
+    assert w.observe("", THREAD + " Someone now A plain draft of something else") is None
+
+
+def test_a_piece_already_on_the_page_before_does_not_count():
+    w, _ = _watcher()
+    with_piece = THREAD + " Earlier " + DRAFT[20:]
+    w.observe(DRAFT, with_piece)
+    assert w.observe("", with_piece) is None
+
+
+def test_keyword_run_logs_the_edit_and_the_excerpt(env):
+    with_keyword = DRAFT + "\nSkills"
+    env.human = [FakePage.edits_to(with_keyword), FakePage.clicks_comment]
+    _seed()
+    assert rr.ReviewRun(PROFILE).run() == rs.HEALTHY
+    entry = _log()[-1]
+    assert entry["outcome"] == rr.POSTED_EDITED
+    assert entry["final_text"] == with_keyword and entry["draft_original"] == DRAFT
+    assert "Skills" in entry["page_excerpt"]
+
+
 def test_empty_box_alone_is_not_posted():
     """They cleared it to retype. However long that takes, keep waiting."""
     w, clock = _watcher(confirm=20)
@@ -506,6 +571,9 @@ class Reader:
         look = self.looks.pop(0) if len(self.looks) > 1 else self.looks[0]
         return look[1]
 
+    def page_text(self):
+        return None
+
     def left_the_post(self):
         return self.left
 
@@ -523,7 +591,7 @@ def test_wait_returns_on_stop():
     control = rr.ReviewControl()
     control.request_stop()
     result = rr.wait_for_human(Reader([(DRAFT, THREAD)]), control, DRAFT, poll_seconds=0)
-    assert result["outcome"] == rr.SKIPPED and result["reason"] == "stopped"
+    assert result["outcome"] == rr.UNKNOWN and result["reason"] == "stopped_with_no_decision"
 
 
 def test_closing_the_window_is_unknown():
@@ -626,13 +694,13 @@ def test_every_listed_reason_but_other_is_enough_alone():
 
 def test_free_text_reason_is_logged_word_for_word(env):
     control = rr.ReviewControl()
-    env.human = [lambda page: control.request_skip("other", "  Already replied by DM  ")]
+    env.human = [lambda page: control.request_skip("other", "  Already replied by DM\n")]
     _seed()
     rr.ReviewRun(PROFILE, control=control).run()
     entry = _log()[-1]
     assert entry["outcome"] == rr.SKIPPED
     assert entry["skip_reason"] == "other"
-    assert entry["skip_note"] == "Already replied by DM"
+    assert entry["skip_note"] == "  Already replied by DM\n"
     assert env.submit.clicks == 0
 
 
@@ -658,14 +726,260 @@ def test_not_now_is_logged_and_offered_again(env):
     assert rs.read_status(PROFILE)["ready"] == 1
 
 
-def test_stop_needs_no_reason_and_stays_queued(env):
+def test_stop_with_no_decision_is_unknown_held_with_evidence(env):
+    """The failure from the first click test. They may have clicked Comment, so a
+    Stop must not read as a skip, and the draft must not be offered again."""
     control = rr.ReviewControl()
     env.human = [lambda page: control.request_stop()]
     _seed()
+    assert rr.ReviewRun(PROFILE, control=control).run() == rs.DEGRADED
+    entry = _log()[-1]
+    assert entry["outcome"] == rr.UNKNOWN and entry["reason"] == "stopped_with_no_decision"
+    assert entry["skip_reason"] is None
+    assert entry["evidence"] and os.path.exists(entry["evidence"])
+    rec = _rec()
+    assert rec["status"] == post_store.GENERATED and rec["needs_check"]
+    assert rs.read_status(PROFILE)["ready"] == 0
+
+
+def test_comment_seen_with_no_thread_selector_counts_as_posted(env):
+    """Clicked Comment, box empty, but no comment selector matches this page."""
+    def posts_with_no_thread(page):
+        page.only_on_page = " You now " + page.box.text
+        page.box.text = ""
+        page.thread.text = ""
+    env.human = [posts_with_no_thread]
+    _seed()
+    assert rr.ReviewRun(PROFILE).run() == rs.HEALTHY
+    entry = _log()[-1]
+    assert entry["outcome"] == rr.POSTED_AS_IS and entry["final_text"] == DRAFT
+    assert _rec()["status"] == post_store.COMMENTED
+
+
+def test_comment_posted_just_before_stop_is_posted_not_unknown(env):
+    control = rr.ReviewControl()
+    env.human = [lambda page: (FakePage.clicks_comment(page), control.request_stop())]
+    _seed()
+    rr.ReviewRun(PROFILE, control=control).run()
+    assert _log()[-1]["outcome"] == rr.POSTED_AS_IS
+    assert _rec()["status"] == post_store.COMMENTED
+
+
+def test_comment_posted_just_before_skip_is_posted_not_trashed(env):
+    control = rr.ReviewControl()
+    env.human = [lambda page: (FakePage.clicks_comment(page),
+                               control.request_skip("draft_not_me"))]
+    _seed()
+    rr.ReviewRun(PROFILE, control=control).run()
+    assert _log()[-1]["outcome"] == rr.POSTED_AS_IS
+    assert _rec()["status"] == post_store.COMMENTED
+
+
+def test_box_text_alone_on_the_page_is_not_posted(env):
+    """Whole-page text includes the box itself, so it only counts once the box is empty."""
+    control = rr.ReviewControl()
+    env.human = [lambda page: None, lambda page: None, lambda page: control.request_stop()]
+    _seed()
+    rr.ReviewRun(PROFILE, control=control).run()
+    assert _log()[-1]["outcome"] == rr.UNKNOWN
+
+
+def test_i_posted_it_finds_the_text_even_if_linkedin_left_it_in_the_box(env):
+    """Posted, but the box never emptied, so only their word can end the wait."""
+    control = rr.ReviewControl()
+    def posted_box_still_full(page):
+        page.thread.text += " You now " + page.box.text
+        control.say_posted()
+    env.human = [posted_box_still_full]
+    _seed()
+    assert rr.ReviewRun(PROFILE, control=control).run() == rs.HEALTHY
+    entry = _log()[-1]
+    assert entry["outcome"] == rr.POSTED_AS_IS and entry["final_text"] == DRAFT
+    assert _rec()["status"] == post_store.COMMENTED
+
+
+def test_i_posted_it_moves_on_and_records_their_word_when_nothing_is_visible(env):
+    control = rr.ReviewControl()
+    env.human = [lambda page: control.say_posted(), FakePage.clicks_comment]
+    _seed(URL, score=90)
+    _seed(URL2, comment="A different draft comment, long enough to find in the thread.",
+          score=10)
+    assert rr.ReviewRun(PROFILE, control=control).run() == rs.DEGRADED
+
+    first, second = _log()
+    assert first["outcome"] == rr.POSTED_ON_THEIR_WORD
+    assert first["final_text"] is None
+    assert first["last_box_text"] == DRAFT
+    assert first["evidence"] and os.path.exists(first["evidence"])
+    assert _rec(URL)["status"] == post_store.COMMENTED    # never offered again
+    assert second["outcome"] == rr.POSTED_AS_IS           # and the run moved on
+    assert env.submit.clicks == 0
+
+
+def test_i_posted_it_never_touches_the_page(env):
+    """It records their word. The only clicks in a run are the opener's."""
+    control = rr.ReviewControl()
+    env.human = [lambda page: control.say_posted()]
+    _seed()
+    rr.ReviewRun(PROFILE, control=control).run()
+    assert env.submit.clicks == 0
+    assert not any(key in _keys_typed(env) for key in SUBMIT_KEYS)
+    assert not any(".click(" in script for script in env.scripts)
+
+
+def test_box_emptying_saves_the_page_and_a_trace_at_that_moment(env):
+    env.human = [FakePage.clicks_comment]
+    _seed()
+    rr.ReviewRun(PROFILE).run()
+    entry = _log()[-1]
+    assert "box_emptied" in entry["evidence"] and os.path.exists(entry["evidence"])
+    traces = os.listdir(pm.get_data_dir(PROFILE, "review_trace"))
+    assert len(traces) == 1
+    with open(os.path.join(pm.get_data_dir(PROFILE, "review_trace"), traces[0]),
+              encoding="utf-8") as f:
+        seen = [json.loads(line) for line in f]
+    assert seen[0]["box_chars"] == len(DRAFT)
+    assert seen[-1]["box_chars"] == 0
+
+
+def test_empty_box_with_no_comment_visible_tells_them_what_to_do(env):
+    control = rr.ReviewControl()
+    def clears_box(page):
+        page.box.text = ""
+    env.human = [clears_box, lambda page: None, lambda page: control.say_posted()]
+    _seed()
+    rr.ReviewRun(PROFILE, control=control).run()
+    assert "I posted it" in control.message
+
+
+def test_page_text_catches_a_repeat_when_thread_selectors_miss(env):
+    env.thread.text = ""
+    env.only_on_page = " You 1d " + DRAFT
+    _seed()
+    assert rr.ReviewRun(PROFILE).run() == rs.HEALTHY
+    assert _log()[-1]["outcome"] == rr.ALREADY_COMMENTED
+    assert env.box.keys == []
+
+
+# Long, with line breaks and every kind of quote: good input must survive untouched.
+MY_VERSION = ("Good point on \"scope creep\". It's the part that's hard to price.\n\n"
+              "What did the first client say when the audit found a gap? " + "More words. " * 60)
+DIRECTION = 'This is too negative. Instead find a point of agreement,\nthen ask a "question".'
+
+
+def _clicks_after_using_my_version(control, text):
+    return [lambda page: (control.give_feedback(rr.FEEDBACK_MY_VERSION, text, "draft_not_me"),
+                          control.request_use_text(text)),
+            lambda page: None,
+            FakePage.clicks_comment]
+
+
+def test_use_this_puts_their_version_in_the_box_and_they_click(env):
+    control = rr.ReviewControl()
+    env.human = _clicks_after_using_my_version(control, MY_VERSION)
+    _seed()
+    assert rr.ReviewRun(PROFILE, control=control).run() == rs.HEALTHY
+
+    entry = _log()[-1]
+    assert entry["outcome"] == rr.POSTED_EDITED
+    assert entry["draft_original"] == DRAFT
+    assert entry["final_text"] == MY_VERSION
+    assert entry["feedback_type"] == rr.FEEDBACK_MY_VERSION
+    assert entry["feedback_text"] == MY_VERSION
+    assert entry["feedback_reason"] == "draft_not_me"
+    assert entry["feedback_used_in_box"] is True
+    assert entry["thread_match"] in ("full", "prefix")
+    assert env.submit.clicks == 0
+    assert "\n" not in _keys_typed(env)            # never typed key by key
+    rec = _rec()
+    assert rec["status"] == post_store.COMMENTED
+    assert rec["comment"] == MY_VERSION and rec["draft_original"] == DRAFT
+
+
+def test_use_this_alone_posts_nothing(env):
+    """It fills the box and waits. The run ends only because they stop it."""
+    control = rr.ReviewControl()
+    env.human = [lambda page: control.request_use_text(MY_VERSION), lambda page: None,
+                 lambda page: control.request_stop()]
+    _seed()
+    rr.ReviewRun(PROFILE, control=control).run()
+    assert env.submit.clicks == 0
+    assert _log()[-1]["outcome"] == rr.UNKNOWN
+    assert _rec()["status"] == post_store.GENERATED
+
+
+def test_direction_with_a_skip_is_logged_word_for_word(env):
+    control = rr.ReviewControl()
+    env.human = [lambda page: (control.give_feedback(rr.FEEDBACK_DIRECTION, DIRECTION, "draft_not_me"),
+                               control.request_skip("draft_not_me"))]
+    _seed()
     rr.ReviewRun(PROFILE, control=control).run()
     entry = _log()[-1]
-    assert entry["reason"] == "stopped" and entry["skip_reason"] is None
-    assert _rec()["status"] == post_store.GENERATED
+    assert entry["outcome"] == rr.SKIPPED and entry["skip_reason"] == "draft_not_me"
+    assert entry["feedback_type"] == rr.FEEDBACK_DIRECTION
+    assert entry["feedback_text"] == DIRECTION
+    assert entry["feedback_used_in_box"] is False
+    assert entry["draft_original"] == DRAFT
+    assert env.box.text == ""                      # direction never goes in the box
+
+
+def test_my_version_logged_with_a_skip_stays_log_only(env):
+    control = rr.ReviewControl()
+    env.human = [lambda page: (control.give_feedback(rr.FEEDBACK_MY_VERSION, MY_VERSION),
+                               control.request_skip("draft_not_me"))]
+    _seed()
+    rr.ReviewRun(PROFILE, control=control).run()
+    entry = _log()[-1]
+    assert entry["feedback_text"] == MY_VERSION and entry["feedback_used_in_box"] is False
+    assert _rec()["comment"] == DRAFT
+
+
+def test_feedback_does_not_carry_over_to_the_next_post(env):
+    control = rr.ReviewControl()
+    env.human = [lambda page: (control.give_feedback(rr.FEEDBACK_DIRECTION, DIRECTION),
+                               control.request_skip("not_now")),
+                 FakePage.clicks_comment]
+    _seed(URL, score=90)
+    _seed(URL2, comment="A different draft comment, long enough to find in the thread.",
+          score=10)
+    rr.ReviewRun(PROFILE, control=control).run()
+    assert _log()[0]["feedback_text"] == DIRECTION
+    assert _log()[1]["feedback_text"] is None
+
+
+def test_feedback_never_changes_the_profile_config(env):
+    before = open(pm.get_config_path(PROFILE), "rb").read()
+    control = rr.ReviewControl()
+    env.human = _clicks_after_using_my_version(control, MY_VERSION)
+    _seed()
+    rr.ReviewRun(PROFILE, control=control).run()
+    assert open(pm.get_config_path(PROFILE), "rb").read() == before
+
+
+def test_text_that_does_not_land_says_so_and_keeps_evidence(env):
+    control = rr.ReviewControl()
+    env.insert_fails = True
+    env.human = [lambda page: (control.give_feedback(rr.FEEDBACK_MY_VERSION, MY_VERSION),
+                               control.request_use_text(MY_VERSION)),
+                 lambda page: None,
+                 lambda page: control.request_stop()]
+    _seed()
+    rr.ReviewRun(PROFILE, control=control).run()
+    assert "did not go in" in control.message
+    assert _log()[-1]["feedback_used_in_box"] is False
+    failures = pm.get_data_dir(PROFILE, "failures")
+    assert any("use_text_did_not_land" in name for name in os.listdir(failures))
+    assert env.submit.clicks == 0
+
+
+def test_blank_text_cannot_be_used_and_is_not_kept():
+    control = rr.ReviewControl()
+    with pytest.raises(ValueError):
+        control.request_use_text("   \n ")
+    control.give_feedback(rr.FEEDBACK_DIRECTION, "  \n")
+    assert control.take_feedback() is None
+    with pytest.raises(ValueError):
+        control.give_feedback("made_up", "words")
 
 
 @pytest.mark.parametrize("answers, expected", [
@@ -688,7 +1002,7 @@ def test_console_skip_also_requires_a_reason(monkeypatch, answers, expected):
 # In a child process on purpose. Tk objects belong to the thread that made them,
 # and garbage collected later on another thread they abort the whole interpreter,
 # which took the rest of the test suite down with no summary line.
-WINDOW_CHECK = """
+WINDOW_CHECK = r"""
 import sys, tkinter
 from linkedin_automation import review_run as rr, review_window
 
@@ -725,9 +1039,36 @@ win.open_skip_panel()
 win.reason.set(labels[rr.OTHER_REASON])
 win.confirm_skip()
 assert control.take_skip() is None, "Other with no text must be refused"
-win.note.set("My own words")
+win.set_words("My own words")
 win.confirm_skip()
 assert control.take_skip() == {"code": rr.OTHER_REASON, "note": "My own words"}
+feedback = control.take_feedback()
+assert feedback["kind"] == rr.FEEDBACK_DIRECTION and feedback["text"] == "My own words"
+
+# Long text with line breaks and quotes comes out exactly as typed.
+exact = 'Too "negative".\n\nFind agreement, then ask: it\'s better. ' + "More. " * 200
+win.open_skip_panel()
+win.reason.set(first_label)
+win.set_words(exact)
+win.confirm_skip()
+assert control.take_skip()["code"] == first_code
+assert control.take_feedback()["text"] == exact
+
+# Use this: needs their own version, needs no reason, and does not skip.
+win.open_skip_panel()
+win.set_words("Only a direction")
+win.use_this()
+assert control.take_use_text() is None and win.problem.get(), "a direction cannot go in the box"
+win.kind.set(rr.FEEDBACK_MY_VERSION)
+win.set_words("")
+win.use_this()
+assert control.take_use_text() is None and win.problem.get(), "blank cannot go in the box"
+win.set_words(exact)
+win.use_this()
+assert control.take_use_text() == exact
+assert control.take_skip() is None, "Use this must not skip"
+assert control.take_feedback()["kind"] == rr.FEEDBACK_MY_VERSION
+assert win.panel_open is False and win.words() == ""
 
 control.done.set()
 win.refresh()
@@ -790,7 +1131,7 @@ def test_stop_ends_the_run_and_closes_the_browser(env):
     _seed(URL2, comment="A different draft comment, long enough to find in the thread.",
           score=10)
     rr.ReviewRun(PROFILE, control=control).run()
-    assert [e["outcome"] for e in _log()] == [rr.SKIPPED]
+    assert [e["outcome"] for e in _log()] == [rr.UNKNOWN]
     assert env.quit_called
 
 
