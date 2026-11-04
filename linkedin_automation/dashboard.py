@@ -25,6 +25,7 @@ from .comment_fields import normalize_comment_fields, comments_to_txt
 from . import platform_policy
 from . import profile_manager as pm
 from . import post_store
+from . import browser_lock
 from . import providers
 from . import scheduler as scheduler_mod
 from . import post_drain as post_drain_mod
@@ -74,7 +75,13 @@ def get_active_jobs(profile=None, task_type=None):
 
 
 def can_start_browser_task(profile):
-    """Check if a browser task can start for this profile."""
+    """Check if a browser task can start for this profile.
+
+    Also honours the cross-process lock, because a morning scan or review run
+    started outside the dashboard uses the same Chrome session.
+    """
+    if browser_lock.is_held(profile):
+        return False
     return len(get_active_jobs(profile=profile, task_type="browser")) == 0
 
 
@@ -838,35 +845,8 @@ def get_comments(profile_name):
 
 
 def _write_lifecycle_input(profile_name, records):
-    """Serialize the store's NEW records to a generator-shaped input JSON file.
-
-    The generator reads ``{"quality_posts": [...]}`` with per-post ``url`` /
-    ``text`` / ``author_name`` keys, then marks each commented post GENERATED in
-    the same store (by URL). Only URL-bearing records are written — a post with
-    no URL can't be commented on or posted, so it stays NEW.
-    """
-    quality_posts = []
-    for r in records:
-        if not r.get("url"):
-            continue
-        quality_posts.append({
-            "url": r["url"],
-            "text": r.get("text", ""),
-            "author_name": r.get("author", ""),
-            "relevance_score": r.get("relevance_score", 0),
-            "post_type": r.get("category", ""),
-            "should_engage": True,
-        })
-    timeline_dir = pm.get_timeline_dir(profile_name)
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    path = os.path.join(timeline_dir, f'lifecycle_new_{ts}.json')
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump({
-            "source": "lifecycle_store",
-            "generated_at": datetime.now().isoformat(),
-            "quality_posts": quality_posts,
-        }, f, indent=2, ensure_ascii=False)
-    return path, len(quality_posts)
+    """Serialize the store's NEW records for the generator (see post_store)."""
+    return post_store.write_generator_input(profile_name, records)
 
 
 @app.route('/api/comments/<profile_name>/generate', methods=['POST'])
@@ -1070,6 +1050,13 @@ def post_comments(profile_name):
     user's edits), exactly like the scheduler's posting job. An explicit
     ``comments_file`` still overrides for a hand-built file.
     """
+    if pm.human_click_only(profile_name):
+        return jsonify({
+            "error": ("This profile is set to human click only, so the tool will "
+                      "not post comments. Use the review run instead."),
+            "human_click_only": True,
+        }), 409
+
     body = request.json or {}
     comments_file = body.get('comments_file', '')
     count = body.get('count', 1)
