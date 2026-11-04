@@ -1187,6 +1187,16 @@ except tkinter.TclError as exc:
     print("NO DISPLAY", exc)
     sys.exit(0)
 win.root.withdraw()
+
+# The care flag takes no room until a post needs it, and goes away with that post.
+assert win.care_label.winfo_manager() == ""
+win.show_care("Read it closely")
+assert win.care.get() == "Read it closely" and win.care_label.winfo_manager() == "pack"
+win.show_care("Read it closely")
+assert win.care_label.winfo_manager() == "pack"
+win.show_care("")
+assert win.care.get() == "" and win.care_label.winfo_manager() == ""
+
 labels = dict((c, l) for c, l, _ in rr.SKIP_REASONS)
 first_code, first_label, _ = rr.SKIP_REASONS[0]
 

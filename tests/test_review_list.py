@@ -76,7 +76,7 @@ def test_list_is_one_json_object_in_ready_order(profile, capsys):
     data = json.loads(out)
     assert [d["url"] for d in data["drafts"]] == [URL2, URL]
     assert set(data["drafts"][0]) == {"key", "url", "author", "text", "comment", "generated_at",
-                                      "relevance_score", "reviewed_at"}
+                                      "relevance_score", "reviewed_at", "moment", "needs_care"}
     assert data["drafts"][1]["text"] == "A made-up post, é."
     assert out.isascii()
 

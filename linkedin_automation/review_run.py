@@ -32,6 +32,7 @@ from selenium.webdriver.common.by import By
 
 from . import browser_lock
 from . import human_behavior as hb
+from . import moment_rules
 from . import post_store
 from . import profile_manager as pm
 from . import review_status as rs
@@ -126,6 +127,7 @@ class ReviewControl:
         self.position = 0
         self.total = 0
         self.author = ""
+        self.care_note = ""
         self.message = "Starting..."
 
     def request_skip(self, reason, note=None):
@@ -814,6 +816,7 @@ class ReviewRun:
                     break
                 self.control.position = position
                 self.control.author = rec.get("author") or ""
+                self.control.care_note = moment_rules.CARE_NOTE if moment_rules.needs_care(rec) else ""
                 self.control.message = "Loading the post..."
                 self._wait_between_posts(last_load)
                 if self.control.stop_requested:

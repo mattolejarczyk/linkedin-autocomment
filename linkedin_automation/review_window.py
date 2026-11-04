@@ -28,6 +28,7 @@ class ReviewWindow:
 
         self.position = tk.StringVar(self.root)
         self.message = tk.StringVar(self.root)
+        self.care = tk.StringVar(self.root)
         self.reason = tk.StringVar(self.root)
         self.kind = tk.StringVar(self.root, value=FEEDBACK_DIRECTION)
         self.problem = tk.StringVar(self.root)
@@ -36,6 +37,10 @@ class ReviewWindow:
                  font=("Segoe UI", 12, "bold")).pack(padx=12, pady=(10, 2))
         tk.Label(self.root, textvariable=self.message, wraplength=340,
                  justify="center").pack(padx=12, pady=(0, 8))
+
+        self.care_label = tk.Label(self.root, textvariable=self.care, wraplength=340,
+                                   justify="center", fg="#b00020",
+                                   font=("Segoe UI", 10, "bold"))
 
         self.buttons = tk.Frame(self.root)
         self.buttons.pack(padx=12, pady=(0, 10))
@@ -129,6 +134,16 @@ class ReviewWindow:
     def cancel_skip(self):
         self.close_skip_panel()
 
+    def show_care(self, note):
+        """The flag for a draft that needs extra care. Takes no room when there is none."""
+        if note == self.care.get():
+            return
+        self.care.set(note)
+        if note:
+            self.care_label.pack(before=self.buttons, padx=12, pady=(0, 8))
+        else:
+            self.care_label.pack_forget()
+
     def refresh(self):
         if self.control.done.is_set():
             self.root.destroy()
@@ -137,6 +152,7 @@ class ReviewWindow:
         where = f"{control.position} of {control.total}" if control.total else ""
         self.position.set(" - ".join(p for p in (where, control.author) if p))
         self.message.set(control.message)
+        self.show_care(control.care_note)
         self.root.after(250, self.refresh)
 
 

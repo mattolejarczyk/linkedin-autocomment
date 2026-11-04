@@ -27,6 +27,7 @@ import sys
 import traceback
 
 from . import browser_lock
+from . import moment_rules
 from . import post_store
 from . import profile_manager as pm
 from . import review_run as rr
@@ -87,7 +88,9 @@ def list_ready(profile_name) -> dict:
     store.sync_with_progress(ledger.get("posted_comments") or [])
     drafts = [{field: rec.get(field) for field in
                ("key", "url", "text", "comment", "generated_at", "relevance_score", "reviewed_at")}
-              | {"author": rec.get("author")}
+              | {"author": rec.get("author"),
+                 "moment": (rec.get("comment_meta") or {}).get("moment"),
+                 "needs_care": moment_rules.needs_care(rec)}
               for rec in rs.ready_drafts(profile_name, store=store)]
     reasons = [{"code": code, "label": label,
                 "needs_note": rr.skip_reason_problem(code) is not None}

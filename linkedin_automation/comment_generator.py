@@ -61,6 +61,8 @@ except ImportError:
 EXIT_OK = pm.EXIT_OK if HAS_PROFILE_MANAGER else 0
 EXIT_ERROR = pm.EXIT_ERROR if HAS_PROFILE_MANAGER else 1
 
+from . import moment_rules
+
 # Lifecycle store (NEW → GENERATED on each accepted comment). Optional so the
 # generator still runs in the degraded no-profile-manager mode.
 try:
@@ -470,6 +472,42 @@ RESPOND WITH JSON:
         cg = (getattr(self, "config", None) or {}).get("comment_generator") or {}
         return [str(v) for v in (cg.get(key) or []) if str(v).strip()]
 
+    def _moment_rules_on(self) -> bool:
+        cg = (getattr(self, "config", None) or {}).get("comment_generator") or {}
+        return bool(cg.get("moment_rules"))
+
+    def decide_moment(self, post: Dict) -> Optional["moment_rules.Moment"]:
+        """Where this person is at, from the whole post. None if that could not be read.
+
+        None means no draft, never "treat it as business": a practitioner question on
+        a post about a layoff is exactly what this step exists to prevent. The post
+        stays NEW and is tried again next run. Asked twice, in case a reply has no answer
+        in it at all.
+        """
+        for attempt in (1, 2):
+            completion = None
+            try:
+                self._log_api_usage("chat.completions:moment", 0.0002)
+                completion = self.provider.complete(
+                    model=self.model,
+                    system="You read where the author of a post is at. Reply with one JSON "
+                           "object and nothing before or after it.",
+                    user=moment_rules.classify_prompt(post.get("text") or "", self.register),
+                    temperature=0.0,
+                    json_object=True,
+                )
+                code = moment_rules.code_from_reply(completion.text)
+                moment = moment_rules.BY_CODE.get(code)
+                if moment is not None:
+                    return moment
+                self._record_reply_failure("moment", post, completion, attempt=attempt,
+                                           detail=f"unknown moment: {code!r}")
+            except Exception as e:
+                self.logger.error(f"Could not read the moment: {e}")
+                self._record_reply_failure("moment", post, completion, attempt=attempt,
+                                           detail=str(e))
+        return None
+
     def _profile_limit(self, key: str) -> Optional[int]:
         """A whole-number limit from this profile's config, or None if it has none."""
         cg = (getattr(self, "config", None) or {}).get("comment_generator") or {}
@@ -776,13 +814,29 @@ Write ONLY the {r.action} text:"""
         """Generate an authentic comment with AI pattern detection."""
         try:
             style, approach = self.get_matched_comment_style(evaluation)
+
+            moment = None
+            if self._moment_rules_on():
+                moment = self.decide_moment(post)
+                if moment is None:
+                    return None
+                if moment.has_own_prompt:
+                    style, approach = {"name": f"moment_{moment.code}"}, moment.code
+            own_prompt = moment is not None and moment.has_own_prompt
             
             # Try up to 3 times to get an authentic comment
             best_attempt = None
             best_score = float('inf')  # Lower is better (fewer issues)
             
             for attempt in range(3):
-                prompt = self.create_authentic_comment_prompt(post, style, approach)
+                if own_prompt:
+                    prompt = moment_rules.comment_prompt(
+                        moment, post, self._build_persona_block(),
+                        self._profile_limit("max_words"), self.register)
+                else:
+                    prompt = self.create_authentic_comment_prompt(post, style, approach)
+                    if moment is not None and moment.code == moment_rules.LEAD_FUNNEL:
+                        prompt += moment_rules.lead_funnel_line(self.register)
                 
                 # IMPROVED: Higher temperature for more variety, increase with each attempt
                 temp = random.uniform(0.6 + (attempt * 0.1), 0.9)
@@ -790,7 +844,7 @@ Write ONLY the {r.action} text:"""
                 self._log_api_usage("chat.completions:generate", 0.0003)
                 completion = self.provider.complete(
                     model=self.model,
-                    system=self.register.system_voice,
+                    system=moment_rules.SYSTEM_MESSAGE if own_prompt else self.register.system_voice,
                     user=prompt,
                     temperature=temp,
                     max_tokens=100,  # Force brevity
@@ -807,8 +861,18 @@ Write ONLY the {r.action} text:"""
                                                attempt=attempt + 1)
                     continue
 
+                # The model says answering would mean inventing an experience. That
+                # is a decision about the post, so it leaves NEW like any turn-down.
+                if own_prompt and moment_rules.is_skip(comment):
+                    self.logger.info(f"  Skipped: {moment.code}, nothing true to say")
+                    self.rejected_posts.append(post)
+                    return None
+
                 # Check authenticity with new detector
                 is_authentic, issues = self.detect_ai_patterns(comment)
+                if moment is not None:
+                    issues = moment_rules.judge(moment, comment, issues)
+                    is_authentic = not issues
 
                 # A banned phrase is never shipped, not even as the fallback
                 # best attempt below: the profile said these words must not be
@@ -825,6 +889,14 @@ Write ONLY the {r.action} text:"""
                 if over:
                     self._record_reply_failure("over_limit", post, completion,
                                                attempt=attempt + 1, detail="; ".join(over))
+                    continue
+
+                # Nor one that breaks its moment's rule, such as a question under a
+                # post about a hard time. Best-attempt must not bring it back.
+                broke_moment = [i for i in issues if i.startswith("moment_rule")]
+                if broke_moment:
+                    self._record_reply_failure("moment_rule", post, completion,
+                                               attempt=attempt + 1, detail="; ".join(broke_moment))
                     continue
 
                 word_count = len(comment.split())
@@ -845,6 +917,9 @@ Write ONLY the {r.action} text:"""
                     'relevant': relevant,
                     'attempt': attempt + 1
                 }
+                if moment is not None:
+                    current['moment'] = moment.code
+                    current['needs_care'] = moment.needs_care
 
                 # Track best attempt for the fallback (fewest AI-pattern issues).
                 if len(issues) < best_score:
@@ -1039,6 +1114,9 @@ Write ONLY the {r.action} text:"""
                     'post_category': post['evaluation'].get('post_category'),
                     'generated_at': comment_data['generated_at']
                 }
+                if 'moment' in comment_data:
+                    result['moment'] = comment_data['moment']
+                    result['needs_care'] = comment_data['needs_care']
                 results.append(result)
 
                 self.logger.info(f"✓ {style} / {approach} ({comment_data['word_count']} words)")
@@ -1063,6 +1141,8 @@ Write ONLY the {r.action} text:"""
         
         self.save_results(results)
         self._mark_generated_in_store(results)
+        # Posts the moment rules turned down while writing.
+        self._trash_rejected_in_store()
         return results
 
     def _trash_rejected_in_store(self):
@@ -1106,11 +1186,15 @@ Write ONLY the {r.action} text:"""
                 url = r.get("post_url") or ""
                 if not url:
                     continue
-                store.mark_generated(url, r.get("comment", ""), meta={
+                meta = {
                     "style": r.get("style", ""),
                     "approach": r.get("approach", ""),
                     "word_count": r.get("word_count", 0),
-                })
+                }
+                if "moment" in r:
+                    meta["moment"] = r["moment"]
+                    meta["needs_care"] = r["needs_care"]
+                store.mark_generated(url, r.get("comment", ""), meta=meta)
             store.save()
         except Exception:
             self.logger.warning("Could not update lifecycle store", exc_info=True)
