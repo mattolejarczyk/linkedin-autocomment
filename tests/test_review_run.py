@@ -1026,6 +1026,15 @@ def test_a_box_that_empties_is_still_recorded_as_emptied(env):
     assert entry["said_posted"] is False and entry["box_emptied"] is True
 
 
+def test_the_window_says_the_comment_is_edited_in_linkedins_box(env):
+    control = rr.ReviewControl()
+    seen = []
+    env.human = [lambda page: seen.append(control.message), FakePage.clicks_comment]
+    _seed()
+    rr.ReviewRun(PROFILE, control=control).run()
+    assert "LinkedIn's box" in seen[0] and "Comment" in seen[0]
+
+
 # Long, with line breaks and every kind of quote: good input must survive untouched.
 MY_VERSION = ("Good point on \"scope creep\". It's the part that's hard to price.\n\n"
               "What did the first client say when the audit found a gap? " + "More words. " * 60)

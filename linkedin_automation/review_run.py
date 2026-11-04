@@ -82,6 +82,10 @@ SKIP_REASONS = (
 OTHER_REASON = "other"
 
 
+#: Shown while a draft waits. The comment is edited in LinkedIn's own box, not here.
+EDIT_IN_LINKEDIN_MESSAGE = ("To change the comment, edit it right in LinkedIn's box. "
+                            "Then click Comment there. Nothing here posts.")
+
 #: What the human's typed words are.
 FEEDBACK_MY_VERSION = "my_version"
 FEEDBACK_DIRECTION = "direction"
@@ -609,7 +613,7 @@ class ReviewRun:
                              evidence=self._evidence("draft_did_not_register"))
             return
 
-        self.control.message = "Read it, edit if you like, then click Comment yourself."
+        self.control.message = EDIT_IN_LINKEDIN_MESSAGE
         self.control.take_feedback()      # nothing carries over from another post
         self.control.take_use_text()
         emptied_evidence = {}

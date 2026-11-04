@@ -318,6 +318,99 @@ def test_banned_phrases_are_named_in_the_prompt(make_generator):
     assert 'a draft containing any of them is rejected: "I", "my worry"' in prompt
 
 
+# ─── Profile length limits: max_words and max_sentences ───────────────────────
+
+LIMITS = {"comment_generator": {"max_words": 35, "max_sentences": 3}}
+
+# The shape of a real draft that passed: four sentences and over forty words.
+OVER_LIMIT = ("Congrats on the launch. Coming back from a hard year to start out alone "
+              "is a solid run. Going from one tool to two others over that time is a long "
+              "way. What has changed most in how the work gets done since then?")
+GOOD = "Which part did you find hardest? The review step looks like the slow one."
+
+
+def _limit_issues(g, text):
+    return [i for i in g.detect_ai_patterns(text)[1] if i.startswith("over_profile_limit")]
+
+
+def test_the_over_limit_draft_is_caught_on_both_counts(make_generator):
+    g = make_generator(config=LIMITS)
+    words = len(OVER_LIMIT.split())
+    assert _limit_issues(g, OVER_LIMIT) == [f"over_profile_limit: {words} words (limit 35)",
+                                            "over_profile_limit: 4 sentences (limit 3)"]
+
+
+def test_a_good_draft_survives_the_limits(make_generator):
+    g = make_generator(config=LIMITS)
+    assert _limit_issues(g, GOOD) == []
+
+
+def test_limits_are_exact_at_the_edge(make_generator):
+    g = make_generator(config=LIMITS)
+    assert _limit_issues(g, " ".join(["word"] * 35)) == []
+    assert _limit_issues(g, " ".join(["word"] * 36))[0].startswith("over_profile_limit: 36 words")
+    assert _limit_issues(g, "One here. Two here! Three here?") == []
+    assert "4 sentences" in _limit_issues(g, "One here. Two here! Three here? Four here.")[0]
+
+
+@pytest.mark.parametrize("text, count", [
+    ("No end mark at all", 1),
+    ("It took 2.5 hours. Was that the norm?", 2),      # a decimal is not a sentence end
+    ("Really?! That fast.", 2),
+    ("First line\nSecond line with no mark", 2),       # a keyword on its own line counts
+    ("", 0),
+])
+def test_sentence_count_reads_real_comments(make_generator, text, count):
+    assert make_generator(config=LIMITS)._count_sentences(text) == count
+
+
+def test_no_limits_configured_changes_nothing(make_generator):
+    g = make_generator(config={})
+    assert _limit_issues(g, OVER_LIMIT) == []
+    assert g.detect_ai_patterns(" ".join(["word"] * 70))[1] == []
+
+
+def test_a_bad_limit_setting_is_ignored_not_fatal(make_generator):
+    g = make_generator(config={"comment_generator": {"max_words": "lots", "max_sentences": -1}})
+    assert _limit_issues(g, OVER_LIMIT) == []
+
+
+def test_an_over_limit_draft_is_never_returned_with_evidence_saved(make_generator):
+    """Not even as the fallback best attempt, which is how it would ship."""
+    client = FakeClient(generation_outputs=[OVER_LIMIT, OVER_LIMIT, OVER_LIMIT])
+    g = make_generator(config=LIMITS, client=client)
+    assert g.generate_comment(POST_ECON, {"post_category": "thought_piece"}) is None
+    evidence = _evidence(g)
+    assert [e["kind"] for e in evidence] == ["over_limit"] * 3
+    assert "over_profile_limit" in evidence[0]["detail"]
+
+
+def test_a_good_draft_after_an_over_limit_one_is_used(make_generator):
+    client = FakeClient(generation_outputs=[OVER_LIMIT, GOOD], relevance_outputs=["YES"])
+    g = make_generator(config=LIMITS, client=client)
+    result = g.generate_comment(POST_ECON, {"post_category": "thought_piece"})
+    assert result["comment"] == GOOD and result["attempt"] == 2
+
+
+def test_the_prompt_states_the_limit_and_never_asks_for_more(make_generator, monkeypatch):
+    """The length lottery asked for up to 70 words whatever the profile said."""
+    from linkedin_automation import comment_generator as gen_module
+    longest = lambda seq, weights=None, k=1: [list(seq)[-1]]
+    monkeypatch.setattr(gen_module.random, "choices", longest)
+    g = make_generator(config=LIMITS)
+    style = {"name": "add_insight", "instruction": "Add a point", "example": "An example."}
+    prompt = g.create_authentic_comment_prompt(POST_ECON, style, "build on idea")
+    assert "Length: Under 35 words" in prompt
+    assert "at most 35 words and 3 sentences" in prompt
+    assert "50-70 words" not in prompt
+
+
+def test_default_config_sets_no_length_limits():
+    import json
+    cg = json.load(open("default_profile_config.json", encoding="utf-8"))["comment_generator"]
+    assert "max_words" not in cg and "max_sentences" not in cg
+
+
 def test_default_config_ships_both_lists_empty():
     import json
     cg = json.load(open("default_profile_config.json", encoding="utf-8"))["comment_generator"]

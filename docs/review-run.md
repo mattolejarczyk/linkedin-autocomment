@@ -34,6 +34,9 @@ python -m linkedin_automation.review_run --profile <name>
 | `--mark-commented URL` | Record a comment you posted by hand. No browser |
 | `--release KEY` | Put a held draft back in the queue. No browser |
 
+To change a comment, edit it right in LinkedIn's box and click Comment there. You do
+not need the window for that.
+
 The small always-on-top window shows where you are, with Skip and Stop. Skip asks
 why: pick a reason from the list, or choose Other and type your own. A skip with no
 reason is refused. "Not now" stays in the queue; every other reason moves the draft
@@ -104,6 +107,13 @@ with no browser. To schedule it, run `tools/register_morning_scan.ps1` yourself.
 | `posts_seen`, `qualified`, `new_drafts` | What it found |
 | `evidence` | The log file to read when something went wrong |
 | `status_written_at` | When this file was last written |
+
+## Length limits
+
+Set `max_words` and `max_sentences` in the profile's `comment_generator` block to make a
+length a rule. A draft over either is retried and never queued, and each rejection is
+saved in `reply_failures.jsonl`. `comment_length_range` is only a request to the model.
+Neither applies to text you edit yourself.
 
 ## Settings
 
