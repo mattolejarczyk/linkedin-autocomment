@@ -52,7 +52,9 @@ class ReviewWindow:
                                      width=52, values=[label for _, label, _ in SKIP_REASONS])
         self.dropdown.pack(fill="x", pady=(2, 8))
 
-        tk.Label(self.panel, text="Your words (optional, needed for Other):").pack(anchor="w")
+        tk.Label(self.panel, text="Your words (optional, needed for Other). To change the "
+                                  "comment itself, edit it in LinkedIn's box instead.",
+                 wraplength=340, justify="left").pack(anchor="w")
         self.text = tk.Text(self.panel, width=52, height=7, wrap="word")
         self.text.pack(fill="x", pady=(2, 4))
         tk.Radiobutton(self.panel, text="A direction: what should be different",

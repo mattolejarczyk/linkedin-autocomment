@@ -470,6 +470,20 @@ RESPOND WITH JSON:
         cg = (getattr(self, "config", None) or {}).get("comment_generator") or {}
         return [str(v) for v in (cg.get(key) or []) if str(v).strip()]
 
+    def _profile_limit(self, key: str) -> Optional[int]:
+        """A whole-number limit from this profile's config, or None if it has none."""
+        cg = (getattr(self, "config", None) or {}).get("comment_generator") or {}
+        try:
+            value = int(cg.get(key) or 0)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    @staticmethod
+    def _count_sentences(text: str) -> int:
+        """Sentences ending in . ! or ?, plus any unpunctuated last line."""
+        return len([s for s in re.split(r"[.!?]+(?:\s+|$)|\n+", text) if s.strip()])
+
     def _build_persona_block(self) -> str:
         """Build the persona/tone/voice/topics/avoid/style-mix block from config.
 
@@ -516,6 +530,14 @@ RESPOND WITH JSON:
             # word-count band silently govern a character-bounded platform.
             lines.append("Aim for roughly " + self.length.describe_range(
                 int(length_range[0]), int(length_range[1])) + ".")
+        limits = []
+        if self._profile_limit("max_words"):
+            limits.append(f"{self._profile_limit('max_words')} words")
+        if self._profile_limit("max_sentences"):
+            limits.append(f"{self._profile_limit('max_sentences')} sentences")
+        if limits:
+            lines.append("Hard limit, a longer draft is rejected: at most "
+                         + " and ".join(limits) + ".")
 
         if not lines:
             return ""
@@ -531,6 +553,10 @@ RESPOND WITH JSON:
             list(self.length.buckets),
             weights=list(self.length.bucket_weights)
         )[0]
+        # A profile's own word limit wins. The lottery above tells the model to write
+        # up to 70 words some of the time, which a shorter limit can never survive.
+        if self._profile_limit("max_words"):
+            length_instruction = f"Under {self._profile_limit('max_words')} words"
         
         # IMPROVED: Much more specific authenticity rules. Register-bearing
         # lines (what "I" is, what the artefact is called, the length rule)
@@ -731,6 +757,18 @@ Write ONLY the {r.action} text:"""
             if re.search(pattern, normalised, re.IGNORECASE):
                 issues.append(f"profile_banned_phrase: {phrase!r}")
 
+        # RULE 6: this PROFILE's own length limits (comment_generator.max_words and
+        # max_sentences). hard_max above is the platform's ceiling; the persona's
+        # comment_length_range is only a request to the model. Without a check here a
+        # draft past the profile's stated limit passes as clean.
+        max_words = self._profile_limit("max_words")
+        if max_words and len(comment.split()) > max_words:
+            issues.append(f"over_profile_limit: {len(comment.split())} words (limit {max_words})")
+        max_sentences = self._profile_limit("max_sentences")
+        if max_sentences and self._count_sentences(comment) > max_sentences:
+            issues.append(f"over_profile_limit: {self._count_sentences(comment)} sentences "
+                          f"(limit {max_sentences})")
+
         is_authentic = len(issues) == 0
         return is_authentic, issues
     
@@ -779,6 +817,14 @@ Write ONLY the {r.action} text:"""
                 if banned:
                     self._record_reply_failure("banned_phrase", post, completion,
                                                attempt=attempt + 1, detail="; ".join(banned))
+                    continue
+
+                # Nor is a draft past the profile's own length limit. Shipping it as
+                # the best attempt would make the limit a suggestion again.
+                over = [i for i in issues if i.startswith("over_profile_limit")]
+                if over:
+                    self._record_reply_failure("over_limit", post, completion,
+                                               attempt=attempt + 1, detail="; ".join(over))
                     continue
 
                 word_count = len(comment.split())
