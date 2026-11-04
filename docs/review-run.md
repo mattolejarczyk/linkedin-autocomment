@@ -143,6 +143,24 @@ length a rule. A draft over either is retried and never queued, and each rejecti
 saved in `reply_failures.jsonl`. `comment_length_range` is only a request to the model.
 Neither applies to text you edit yourself.
 
+## Fitting a comment to the person
+
+Set `moment_rules` to `true` in the profile's `comment_generator` block to read the whole
+post before writing and follow the rule for where the person is at: a win, a win after
+hardship, a hard time, a personal or business lesson, a question to readers, plain
+business, or a lead funnel. Business and funnel posts keep the usual prompt. It is off by
+default.
+
+These rules win over the profile's persona where they differ, so a win may state a feeling
+and use one exclamation mark. A draft that breaks its moment's rule, such as a question
+under a hard time, is retried and never queued. If the moment cannot be read there is no
+draft, and the reply is saved in `reply_failures.jsonl`. It never falls back to a business
+comment.
+
+A hard-time draft carries `needs_care`. The review window shows it in red, and `--list`
+returns it with `moment` for each draft. Nothing changes the draft for you: your review is
+the safeguard.
+
 ## Settings
 
 The `review` block of the profile config, with defaults:

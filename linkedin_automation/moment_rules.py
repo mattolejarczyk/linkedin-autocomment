@@ -176,6 +176,14 @@ def lead_funnel_line(r) -> str:
             "write that word and do not ask for the thing.")
 
 
+#: Shown beside a draft that needs a human's eye for tone.
+CARE_NOTE = "This person is going through a hard time. Read it closely before you post."
+
+
+def needs_care(rec: dict) -> bool:
+    return bool((rec.get("comment_meta") or {}).get("needs_care"))
+
+
 def problems(moment: Moment, comment: str) -> list:
     """What this draft breaks of its moment's rule. Checked, not left to the model."""
     found = []

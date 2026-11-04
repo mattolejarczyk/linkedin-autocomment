@@ -277,3 +277,35 @@ def test_with_no_moment_the_store_meta_is_as_before(make, comments_dir):
                                  "approach": "a", "word_count": 1}])
     rec = post_store.PostStore("t", platform=g.platform)._resolve(POST["url"])
     assert set(rec["comment_meta"]) == {"style", "approach", "word_count"}
+
+
+# ─── The flag reaches the review screens ──────────────────────────────────────
+
+def test_needs_care_reads_the_stored_meta():
+    assert mr.needs_care({"comment_meta": {"needs_care": True}}) is True
+    assert mr.needs_care({"comment_meta": {"needs_care": False}}) is False
+    assert mr.needs_care({"comment_meta": None}) is False
+    assert mr.needs_care({}) is False
+
+
+def test_a_review_run_sets_the_flag_for_that_post_only():
+    from linkedin_automation import review_run as rr
+    with open(rr.__file__, encoding="utf-8") as f:
+        source = f.read()
+    at = source.index("self.control.author = rec.get")
+    assert "moment_rules.needs_care(rec)" in source[at:at + 200]
+    assert rr.ReviewControl().care_note == ""
+
+
+def test_the_list_returns_the_moment_and_flag(comments_dir, tmp_path, monkeypatch):
+    from linkedin_automation import review_list as rl
+    from linkedin_automation import review_status as rs
+    rec = {"key": "k", "url": "u", "text": "t", "comment": "c", "author": "a",
+           "comment_meta": {"moment": mr.HARD_TIME, "needs_care": True}}
+    plain = {"key": "k2", "url": "u2", "text": "t", "comment": "c", "author": "a"}
+    monkeypatch.setattr(rs, "ready_drafts", lambda profile, store=None: [rec, plain])
+    monkeypatch.setattr(rl, "_read_store",
+                        lambda profile, reconcile=False: post_store.PostStore("t"))
+    drafts = rl.list_ready("t")["drafts"]
+    assert drafts[0]["moment"] == mr.HARD_TIME and drafts[0]["needs_care"] is True
+    assert drafts[1]["moment"] is None and drafts[1]["needs_care"] is False
